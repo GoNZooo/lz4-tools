@@ -170,10 +170,33 @@ frame_next :: proc(
 Block :: struct {
 	length:       int,
 	literals:     []byte,
+	offset:       int,
 	match_length: int,
 }
 
-read_block :: proc(r: ^bytes.Reader) -> (block: Block, error: io.Error) {
+Block_Error :: union {
+	Zero_Offset,
+	Not_Enough_Literals,
+	io.Error,
+	mem.Allocator_Error,
+}
+
+Zero_Offset :: struct {
+	position: int,
+}
+
+Not_Enough_Literals :: struct {
+	expected: int,
+	actual:   int,
+}
+
+read_block :: proc(
+	r: ^bytes.Reader,
+	allocator := context.allocator,
+) -> (
+	block: Block,
+	error: Block_Error,
+) {
 	token_byte := bytes.reader_read_byte(r) or_return
 	last_read_length := int(token_byte >> 4)
 	block.length = last_read_length
@@ -183,6 +206,45 @@ read_block :: proc(r: ^bytes.Reader) -> (block: Block, error: io.Error) {
 		block.length += last_read_length
 	}
 
+	if block.length == 0 {
+		block.literals = []byte{}
+	} else {
+		literals := make([]byte, block.length, allocator) or_return
+
+		literal_bytes_read := bytes.reader_read(r, literals) or_return
+		if literal_bytes_read != block.length {
+			return Block{},
+				Not_Enough_Literals{expected = block.length, actual = literal_bytes_read}
+		}
+
+		block.literals = literals
+	}
+
+	if token_byte & 0x0f == 0 {
+
+	}
+
+	offset_buffer: [2]byte
+	_, offset_read := bytes.reader_read(r, offset_buffer[:])
+	if offset_read == .EOF {
+		// This means we've read the last block, we have only literals and no offset
+		return block, nil
+	}
+	offset := transmute(u16le)offset_buffer
+	if offset == 0 {
+		return Block{}, Zero_Offset{position = int(r.i)}
+	}
+	block.offset = -int(offset)
+
+	last_read_length = int(token_byte & 0x0f)
+	block.match_length = last_read_length
+	for last_read_length == 15 || last_read_length == 255 {
+		b := bytes.reader_read_byte(r) or_return
+		last_read_length = int(b)
+		block.match_length += last_read_length
+	}
+	block.match_length += 4
+
 	return block, nil
 }
 
@@ -190,39 +252,51 @@ read_block :: proc(r: ^bytes.Reader) -> (block: Block, error: io.Error) {
 test_read_block :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
 
-	bytes_1 := []byte{0x80}
+	bytes_1_prelude := []byte{0x88}
+	offset_bytes_1 := transmute([2]byte)u16le(4)
+	bytes_1 := bytes.concatenate(
+		[][]byte{bytes_1_prelude, bytes.repeat([]byte{0}, 8), offset_bytes_1[:]},
+	)
 	r1: bytes.Reader
 	bytes.reader_init(&r1, bytes_1)
 	block1, err1 := read_block(&r1)
 	testing.expect_value(t, err1, nil)
-	testing.expect_value(t, block1.length, 0x8)
+	testing.expect_value(t, block1.length, 8)
+	testing.expect_value(t, block1.match_length, 12)
+	testing.expect_value(t, block1.offset, 4)
 
-	bytes_2 := []byte{0xf0, 0xff, 0x2}
+	bytes_2_prelude := []byte{0xf4, 0xff, 2}
+	offset_bytes_2 := transmute([2]byte)u16le(1)
+	bytes_2 := bytes.concatenate(
+		[][]byte{bytes_2_prelude, bytes.repeat([]byte{0}, 15 + 255 + 2), offset_bytes_2[:]},
+	)
 	r2: bytes.Reader
 	bytes.reader_init(&r2, bytes_2)
 	block2, err2 := read_block(&r2)
 	testing.expect_value(t, err2, nil)
 	testing.expect_value(t, block2.length, 15 + 255 + 2)
+	testing.expect_value(t, block2.match_length, 8)
+	testing.expect_value(t, block2.offset, 1)
 
 	bytes_3 := []byte{0xf0, 33}
 	r3: bytes.Reader
 	bytes.reader_init(&r3, bytes_3)
 	block3, err3 := read_block(&r3)
-	testing.expect_value(t, err3, nil)
+	testing.expect_value(t, err3, io.Error.EOF)
 	testing.expect_value(t, block3.length, 48)
 
 	bytes_4 := []byte{0xf0, 255, 10}
 	r4: bytes.Reader
 	bytes.reader_init(&r4, bytes_4)
 	block4, err4 := read_block(&r4)
-	testing.expect_value(t, err4, nil)
+	testing.expect_value(t, err4, io.Error.EOF)
 	testing.expect_value(t, block4.length, 280)
 
 	bytes_5 := []byte{0xf0, 0}
 	r5: bytes.Reader
 	bytes.reader_init(&r5, bytes_5)
 	block5, err5 := read_block(&r5)
-	testing.expect_value(t, err5, nil)
+	testing.expect_value(t, err5, io.Error.EOF)
 	testing.expect_value(t, block5.length, 15)
 }
 

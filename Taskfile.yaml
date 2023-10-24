@@ -4,6 +4,7 @@ tasks:
   build:
     deps:
       - build_lz4_frames
+      - build_lz4_blocks
     method: none
     silent: true
   
@@ -15,6 +16,16 @@ tasks:
       - lz4-frames/**/*.odin
     generates:
       - bin/lz4-frames
+    silent: true
+
+  build_lz4_blocks:
+    cmds:
+      - odin build lz4-blocks -out:bin/lz4-blocks -o:speed
+    sources:
+      - lz4/**/*.odin
+      - lz4-blocks/**/*.odin
+    generates:
+      - bin/lz4-blocks
     silent: true
 
   test:

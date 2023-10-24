@@ -3,6 +3,7 @@ package lz4
 import "core:bytes"
 import "core:fmt"
 import "core:hash/xxhash"
+import "core:io"
 import "core:log"
 import "core:mem"
 import "core:os"
@@ -164,6 +165,65 @@ frame_next :: proc(
 	}
 
 	return Frame{}, nil, No_Frame{}
+}
+
+Block :: struct {
+	length:       int,
+	literals:     []byte,
+	match_length: int,
+}
+
+read_block :: proc(r: ^bytes.Reader) -> (block: Block, error: io.Error) {
+	token_byte := bytes.reader_read_byte(r) or_return
+	last_read_length := int(token_byte >> 4)
+	block.length = last_read_length
+	for last_read_length == 15 || last_read_length == 255 {
+		b := bytes.reader_read_byte(r) or_return
+		last_read_length = int(b)
+		block.length += last_read_length
+	}
+
+	return block, nil
+}
+
+@(test, private = "package")
+test_read_block :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
+
+	bytes_1 := []byte{0x80}
+	r1: bytes.Reader
+	bytes.reader_init(&r1, bytes_1)
+	block1, err1 := read_block(&r1)
+	testing.expect_value(t, err1, nil)
+	testing.expect_value(t, block1.length, 0x8)
+
+	bytes_2 := []byte{0xf0, 0xff, 0x2}
+	r2: bytes.Reader
+	bytes.reader_init(&r2, bytes_2)
+	block2, err2 := read_block(&r2)
+	testing.expect_value(t, err2, nil)
+	testing.expect_value(t, block2.length, 15 + 255 + 2)
+
+	bytes_3 := []byte{0xf0, 33}
+	r3: bytes.Reader
+	bytes.reader_init(&r3, bytes_3)
+	block3, err3 := read_block(&r3)
+	testing.expect_value(t, err3, nil)
+	testing.expect_value(t, block3.length, 48)
+
+	bytes_4 := []byte{0xf0, 255, 10}
+	r4: bytes.Reader
+	bytes.reader_init(&r4, bytes_4)
+	block4, err4 := read_block(&r4)
+	testing.expect_value(t, err4, nil)
+	testing.expect_value(t, block4.length, 280)
+
+	bytes_5 := []byte{0xf0, 0}
+	r5: bytes.Reader
+	bytes.reader_init(&r5, bytes_5)
+	block5, err5 := read_block(&r5)
+	testing.expect_value(t, err5, nil)
+	testing.expect_value(t, block5.length, 15)
 }
 
 get_block_max_size :: proc(byte: byte) -> int {

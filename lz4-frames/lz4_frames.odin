@@ -9,7 +9,7 @@ main :: proc() {
 	arguments := os.args[1:]
 
 	if len(arguments) == 0 {
-		fmt.println("Usage: lz4-frames <file>")
+		fmt.printf("Usage: %s <file>", os.args[0])
 		os.exit(1)
 	}
 

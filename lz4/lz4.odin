@@ -167,14 +167,27 @@ frame_next :: proc(
 	return Frame{}, nil, No_Frame{}
 }
 
-Block :: struct {
+Data_Block :: struct {
 	length:       int,
 	literals:     []byte,
 	offset:       int,
 	match_length: int,
 }
 
-Block_Error :: union {
+Decompress_Frame_Error :: union {
+	Insufficient_Space_In_Buffer,
+	Decompress_Frame_Block_Error,
+	io.Error,
+	mem.Allocator_Error,
+}
+
+Decompress_Frame_Block_Error :: struct {
+	block:            Frame_Block,
+	data_block_index: int,
+	error:            Data_Block_Error,
+}
+
+Data_Block_Error :: union {
 	Zero_Offset,
 	Not_Enough_Literals,
 	io.Error,
@@ -190,12 +203,170 @@ Not_Enough_Literals :: struct {
 	actual:   int,
 }
 
-read_block :: proc(
+Insufficient_Space_In_Buffer :: struct {
+	expected: int,
+	actual:   int,
+}
+
+Decompress_Frame_Result :: union {
+	[][]byte,
+	[]byte,
+}
+
+decompress_frame :: proc(
+	frame: Frame,
+	allocator := context.allocator,
+) -> (
+	decompressed: Decompress_Frame_Result,
+	error: Decompress_Frame_Error,
+) {
+	// NOTE(gonz): if we have block dependence but only one block in the frame it should be the same
+	// as having independent blocks, I assume
+	if !frame.descriptor.block_independence && len(frame.blocks) > 1 {
+		return decompress_frame_dependently(frame, allocator)
+	}
+
+	decompressed_blocks := make([dynamic][]byte, 0, len(frame.blocks), allocator) or_return
+
+	for b in frame.blocks {
+		if !b.compressed {
+			// NOTE(gonz): uncompressed blocks are copied into newly allocated space so they can be
+			// freed the same way as compressed blocks, even though we don't technically necessarily
+			// need the allocation to copy them over to the resulting dynamic array
+			cloned_data := make([]byte, len(b.data), allocator) or_return
+			copy(cloned_data, b.data)
+			append(&decompressed_blocks, cloned_data) or_return
+
+			continue
+		}
+
+		decompressed_block := decompress_frame_block(
+			b,
+			frame.descriptor.block_max_size,
+			allocator,
+		) or_return
+		append(&decompressed_blocks, decompressed_block) or_return
+	}
+
+	return decompressed_blocks[:], nil
+}
+
+decompress_frame_block :: proc(
+	fb: Frame_Block,
+	max_block_size: int,
+	allocator := context.allocator,
+) -> (
+	decompressed: []byte,
+	error: Decompress_Frame_Error,
+) {
+	b: bytes.Buffer
+	bytes.buffer_init_allocator(&b, 0, max_block_size, allocator)
+	r: bytes.Reader
+	bytes.reader_init(&r, fb.data)
+
+	for {
+		db, data_block_read_error := read_data_block(&r, allocator)
+		if data_block_read_error == .EOF {
+			break
+		} else if data_block_read_error != nil {
+			return nil,
+				Decompress_Frame_Block_Error{
+					block = fb,
+					data_block_index = len(decompressed),
+					error = data_block_read_error,
+				}
+		}
+
+		bytes.buffer_write(&b, db.literals) or_return
+
+		if db.offset == 0 {
+			continue
+		}
+
+		if db.offset < db.match_length {
+			copy_start := len(b.buf) - db.offset
+			copy_bytes := b.buf[copy_start:]
+			bytes.buffer_write(&b, copy_bytes) or_return
+
+			remaining := db.match_length - db.offset
+			for remaining > 0 {
+				bytes.buffer_write_byte(&b, copy_bytes[len(copy_bytes) - 1]) or_return
+				remaining -= 1
+			}
+		} else {
+			match_start := len(b.buf) - db.offset
+			match_end := match_start + db.match_length
+			match_bytes := b.buf[match_start:match_end]
+			bytes.buffer_write(&b, match_bytes) or_return
+		}
+	}
+
+	decompressed = bytes.buffer_to_bytes(&b)
+
+	return decompressed, nil
+}
+
+@(test, private = "package")
+test_decompress_frame_block :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
+
+	path :: "test-data/plain-01-checksum.lz4"
+	file_data, read_ok := os.read_entire_file_from_filename(path)
+	if !read_ok {
+		panic("Could not read file for test: '" + path + "'")
+	}
+
+	plain_text_path :: "test-data/plain-01.txt"
+	plain_data, plain_read_ok := os.read_entire_file_from_filename(plain_text_path)
+	if !plain_read_ok {
+		panic("Could not read file for test: '" + plain_text_path + "'")
+	}
+
+	frame, _, frame_error := frame_next(file_data)
+	if frame_error != nil {
+		panic("Could not read frame")
+	}
+	assert(len(frame.blocks) == 1)
+	decompressed, decompress_error := decompress_frame(frame)
+	testing.expect(
+		t,
+		decompress_error == nil,
+		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
+	)
+
+	switch d in decompressed {
+	case []byte:
+		testing.expect(
+			t,
+			bytes.compare(d, plain_data) == 0,
+			fmt.tprintf("Decompressed data does not match plain data: '%s'\n", d),
+		)
+	case [][]byte:
+		concatenated := bytes.concatenate(d)
+		testing.expect(
+			t,
+			bytes.compare(concatenated, plain_data) == 0,
+			fmt.tprintf("Decompressed data does not match plain data: '%s'\n", concatenated),
+		)
+	}
+}
+
+decompress_frame_dependently :: proc(
+	frame: Frame,
+	allocator := context.allocator,
+) -> (
+	decompressed: []byte,
+	error: Decompress_Frame_Error,
+) {
+	log.panicf("Block dependence not currently supported")
+}
+
+read_data_block :: proc(
 	r: ^bytes.Reader,
 	allocator := context.allocator,
 ) -> (
-	block: Block,
-	error: Block_Error,
+	block: Data_Block,
+	error: Data_Block_Error,
 ) {
 	token_byte := bytes.reader_read_byte(r) or_return
 	last_read_length := int(token_byte >> 4)
@@ -213,7 +384,7 @@ read_block :: proc(
 
 		literal_bytes_read := bytes.reader_read(r, literals) or_return
 		if literal_bytes_read != block.length {
-			return Block{},
+			return Data_Block{},
 				Not_Enough_Literals{expected = block.length, actual = literal_bytes_read}
 		}
 
@@ -232,9 +403,9 @@ read_block :: proc(
 	}
 	offset := transmute(u16le)offset_buffer
 	if offset == 0 {
-		return Block{}, Zero_Offset{position = int(r.i)}
+		return Data_Block{}, Zero_Offset{position = int(r.i)}
 	}
-	block.offset = -int(offset)
+	block.offset = int(offset)
 
 	last_read_length = int(token_byte & 0x0f)
 	block.match_length = last_read_length
@@ -249,7 +420,7 @@ read_block :: proc(
 }
 
 @(test, private = "package")
-test_read_block :: proc(t: ^testing.T) {
+test_read_data_block :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
 
 	bytes_1_prelude := []byte{0x88}
@@ -259,7 +430,7 @@ test_read_block :: proc(t: ^testing.T) {
 	)
 	r1: bytes.Reader
 	bytes.reader_init(&r1, bytes_1)
-	block1, err1 := read_block(&r1)
+	block1, err1 := read_data_block(&r1)
 	testing.expect_value(t, err1, nil)
 	testing.expect_value(t, block1.length, 8)
 	testing.expect_value(t, block1.match_length, 12)
@@ -272,7 +443,7 @@ test_read_block :: proc(t: ^testing.T) {
 	)
 	r2: bytes.Reader
 	bytes.reader_init(&r2, bytes_2)
-	block2, err2 := read_block(&r2)
+	block2, err2 := read_data_block(&r2)
 	testing.expect_value(t, err2, nil)
 	testing.expect_value(t, block2.length, 15 + 255 + 2)
 	testing.expect_value(t, block2.match_length, 8)
@@ -281,21 +452,21 @@ test_read_block :: proc(t: ^testing.T) {
 	bytes_3 := []byte{0xf0, 33}
 	r3: bytes.Reader
 	bytes.reader_init(&r3, bytes_3)
-	block3, err3 := read_block(&r3)
+	block3, err3 := read_data_block(&r3)
 	testing.expect_value(t, err3, io.Error.EOF)
 	testing.expect_value(t, block3.length, 48)
 
 	bytes_4 := []byte{0xf0, 255, 10}
 	r4: bytes.Reader
 	bytes.reader_init(&r4, bytes_4)
-	block4, err4 := read_block(&r4)
+	block4, err4 := read_data_block(&r4)
 	testing.expect_value(t, err4, io.Error.EOF)
 	testing.expect_value(t, block4.length, 280)
 
 	bytes_5 := []byte{0xf0, 0}
 	r5: bytes.Reader
 	bytes.reader_init(&r5, bytes_5)
-	block5, err5 := read_block(&r5)
+	block5, err5 := read_data_block(&r5)
 	testing.expect_value(t, err5, io.Error.EOF)
 	testing.expect_value(t, block5.length, 15)
 }
@@ -337,20 +508,6 @@ test_frame_next :: proc(t: ^testing.T) {
 		_, err := append(&frames, frame)
 		if err != nil {
 			panic("Could not append frame")
-		}
-	}
-
-	for frame, i in frames {
-		fmt.printf("[%d] %v\n", i, frame.descriptor)
-		fmt.printf("\tBlock count: %d\n", len(frame.blocks))
-		for block, j in frame.blocks {
-			fmt.printf(
-				"\t\t[%d] Size=%d, Compressed=%v, Checksum=%d\n",
-				j,
-				block.size,
-				block.compressed,
-				block.checksum,
-			)
 		}
 	}
 

@@ -12,19 +12,21 @@ import "core:testing"
 MAGIC_VALUE :: 0x184D2204
 
 Frame :: struct {
-	descriptor: Frame_Descriptor,
-	blocks:     []Frame_Block,
+	descriptor:       Frame_Descriptor,
+	blocks:           []Frame_Block,
+	content_checksum: u32le,
 }
 
 Frame_Descriptor :: struct {
-	version:             int,
-	block_independence:  bool,
-	has_block_checksum:  bool,
-	block_max_size:      int,
-	content_size:        int,
-	dictionary_id:       int,
-	header_checksum:     u8,
-	calculated_checksum: u8,
+	version:              int,
+	block_independence:   bool,
+	has_block_checksum:   bool,
+	has_content_checksum: bool,
+	calculated_checksum:  u8,
+	header_checksum:      u8,
+	block_max_size:       int,
+	content_size:         int,
+	dictionary_id:        int,
 }
 
 Frame_Block :: struct {
@@ -54,6 +56,7 @@ Infinite_Frame :: struct {
 frame_next :: proc(
 	data: []byte,
 	allocator := context.allocator,
+	loc := #caller_location,
 ) -> (
 	frame: Frame,
 	rest: []byte,
@@ -82,7 +85,7 @@ frame_next :: proc(
 		block_independence := flags & 0x20 != 0
 		has_block_checksum := flags & 0x10 != 0
 		has_content_size := flags & 0x08 != 0
-		// has_content_checksum := flags & 0x04 != 0
+		has_content_checksum := flags & 0x04 != 0
 		has_dictionary_id := flags & 0x01 != 0
 
 		ix += 1
@@ -94,6 +97,7 @@ frame_next :: proc(
 		frame.descriptor.version = version
 		frame.descriptor.block_independence = block_independence
 		frame.descriptor.has_block_checksum = has_block_checksum
+		frame.descriptor.has_content_checksum = has_content_checksum
 		frame.descriptor.block_max_size = block_max_size
 
 		content_size := has_content_size ? mem.reinterpret_copy(int, raw_data(data[ix:ix + 8])) : 0
@@ -123,7 +127,6 @@ frame_next :: proc(
 
 		blocks := make([dynamic]Frame_Block, 0, 0, allocator) or_return
 
-		frame_end: int
 		for {
 			is_compressed := data[ix] & 0x80 != 0
 			block_size := mem.reinterpret_copy(u32le, raw_data(data[ix:ix + 4]))
@@ -141,6 +144,14 @@ frame_next :: proc(
 			ix += block.size
 			if has_block_checksum {
 				block.checksum = mem.reinterpret_copy(u32, raw_data(data[ix:ix + 4]))
+				assert(
+					block.checksum == xxhash.XXH32(block.data, 0),
+					fmt.tprintf(
+						"Block checksum mismatch: %d != %d",
+						block.checksum,
+						xxhash.XXH32(block.data, 0),
+					),
+				)
 				ix += 4
 			}
 
@@ -148,18 +159,19 @@ frame_next :: proc(
 		}
 		frame.blocks = blocks[:]
 
-		if frame_end == 0 {
-			frame_end = bytes.index(data[ix:], []byte{0, 0, 0, 0})
-		}
-		if frame_end == -1 {
-			return Frame{}, data, Infinite_Frame{start = i}
+		end_marker_value := mem.reinterpret_copy(u32le, raw_data(data[ix:ix + 4]))
+		assert(
+			end_marker_value == 0,
+			fmt.tprintf("End marker bytes are not 0: %d", end_marker_value),
+		)
+		ix += 4
+
+		if has_content_checksum {
+			frame.content_checksum = mem.reinterpret_copy(u32le, raw_data(data[ix:ix + 4]))
+			ix += 4
 		}
 
-		frame_end += i
-		frame_end += 4 // Add the 4 bytes of the magic number
-		frame_end += 4 // Add the 4 bytes of the frame end marker
-
-		rest = data[frame_end:]
+		rest = data[ix:]
 
 		return frame, rest, nil
 	}
@@ -307,7 +319,7 @@ decompress_frame_block :: proc(
 }
 
 @(test, private = "package")
-test_decompress_frame_block :: proc(t: ^testing.T) {
+test_decompress_frame :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
 
 	path :: "test-data/plain-01-checksum.lz4"
@@ -391,10 +403,6 @@ read_data_block :: proc(
 		block.literals = literals
 	}
 
-	if token_byte & 0x0f == 0 {
-
-	}
-
 	offset_buffer: [2]byte
 	_, offset_read := bytes.reader_read(r, offset_buffer[:])
 	if offset_read == .EOF {
@@ -471,6 +479,276 @@ test_read_data_block :: proc(t: ^testing.T) {
 	testing.expect_value(t, block5.length, 15)
 }
 
+frame_serialize :: proc(
+	f: Frame,
+	allocator := context.allocator,
+	loc := #caller_location,
+) -> (
+	data: []byte,
+	error: io.Error,
+) {
+	b: bytes.Buffer
+	bytes.buffer_init_allocator(&b, 0, 0, allocator)
+
+	magic_value_bytes := transmute([4]byte)u32le(MAGIC_VALUE)
+	bytes.buffer_write(&b, magic_value_bytes[:]) or_return
+
+	flags := u8(f.descriptor.version << 6)
+	if f.descriptor.block_independence {
+		flags |= 0x20
+	}
+	if f.descriptor.has_block_checksum {
+		flags |= 0x10
+	}
+	if f.descriptor.content_size != 0 {
+		flags |= 0x08
+	}
+	if f.descriptor.has_content_checksum {
+		flags |= 0x04
+	}
+	if f.descriptor.dictionary_id != 0 {
+		flags |= 0x01
+	}
+	bytes.buffer_write_byte(&b, flags) or_return
+
+	bd_byte := encode_block_max_size(f.descriptor.block_max_size) << 4
+	bytes.buffer_write_byte(&b, bd_byte) or_return
+
+	if f.descriptor.content_size != 0 {
+		content_size_bytes := transmute([8]byte)u64le(f.descriptor.content_size)
+		bytes.buffer_write(&b, content_size_bytes[:]) or_return
+	}
+
+	if f.descriptor.dictionary_id != 0 {
+		dictionary_id_bytes := transmute([4]byte)u32le(f.descriptor.dictionary_id)
+		bytes.buffer_write(&b, dictionary_id_bytes[:]) or_return
+	}
+
+	bytes_so_far := bytes.buffer_to_bytes(&b)
+	header_bytes := bytes_so_far[4:]
+	hash := xxhash.XXH32(header_bytes, 0)
+	// we skip the magic number for the checksum calculation
+	header_checksum := u8(hash >> 8)
+	assert(
+		header_checksum == f.descriptor.header_checksum,
+		fmt.tprintf(
+			"Checksum mismatch:\n\tCalculated: %#x\n\tFrame object checksum: %#x (called from %v)",
+			header_checksum,
+			f.descriptor.header_checksum,
+			loc,
+		),
+	)
+	bytes.buffer_write_byte(&b, header_checksum) or_return
+
+	write_frame_blocks(&b, f.descriptor.has_block_checksum, f.blocks) or_return
+
+	end_frame_bytes := transmute([4]byte)u32le(0)
+	bytes.buffer_write(&b, end_frame_bytes[:]) or_return
+
+	if f.descriptor.has_content_checksum {
+		content_checksum_bytes := transmute([4]byte)f.content_checksum
+		bytes.buffer_write(&b, content_checksum_bytes[:]) or_return
+	}
+
+	return bytes.buffer_to_bytes(&b), nil
+}
+
+@(private = "file")
+write_frame_blocks :: proc(
+	b: ^bytes.Buffer,
+	has_checksum: bool,
+	blocks: []Frame_Block,
+) -> io.Error {
+	for block in blocks {
+		block_size := block.size
+		if !block.compressed {
+			block_size |= 0x8000_0000
+		}
+		block_size_bytes := transmute([4]byte)u32le(block_size)
+		bytes.buffer_write(b, block_size_bytes[:]) or_return
+
+		bytes.buffer_write(b, block.data) or_return
+
+		if has_checksum {
+			block_checksum_bytes := transmute([4]byte)u32(block.checksum)
+			bytes.buffer_write(b, block_checksum_bytes[:]) or_return
+		}
+	}
+
+	return nil
+}
+
+@(test, private = "package")
+test_frame_serialize :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
+
+	path :: "test-data/plain-01-checksum.lz4"
+	file_data, read_ok := os.read_entire_file_from_filename(path)
+	if !read_ok {
+		panic("Could not read file for test: '" + path + "'")
+	}
+
+	frame, rest, frame_error := frame_next(file_data)
+	if frame_error != nil {
+		panic("Could not read frame")
+	}
+	if len(rest) != 0 {
+		panic("Have remaining data after reading frame")
+	}
+
+	serialized, serialize_error := frame_serialize(frame)
+	testing.expect(
+		t,
+		serialize_error == nil,
+		fmt.tprintf("Serialize error is not nil: %v\n", serialize_error),
+	)
+
+	testing.expect(
+		t,
+		len(serialized) == len(file_data),
+		fmt.tprintf(
+			"Serialized data is not the same size as original data: %d != %d\n",
+			len(serialized),
+			len(file_data),
+		),
+	)
+
+	if len(serialized) == len(file_data) {
+		serialized_frame, serialized_rest, serialized_frame_error := frame_next(serialized)
+		testing.expect(
+			t,
+			serialized_frame_error == nil,
+			fmt.tprintf("Serialized frame error is not nil: %v\n", serialized_frame_error),
+		)
+		testing.expect(
+			t,
+			len(serialized_rest) == 0,
+			fmt.tprintf("Serialized rest is not empty: %#x\n", serialized_rest),
+		)
+
+		testing.expect_value(t, serialized_frame.content_checksum, frame.content_checksum)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.block_independence,
+			frame.descriptor.block_independence,
+		)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.block_max_size,
+			frame.descriptor.block_max_size,
+		)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.calculated_checksum,
+			frame.descriptor.calculated_checksum,
+		)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.content_size,
+			frame.descriptor.content_size,
+		)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.dictionary_id,
+			frame.descriptor.dictionary_id,
+		)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.has_block_checksum,
+			frame.descriptor.has_block_checksum,
+		)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.has_content_checksum,
+			frame.descriptor.has_content_checksum,
+		)
+		testing.expect_value(
+			t,
+			serialized_frame.descriptor.header_checksum,
+			frame.descriptor.header_checksum,
+		)
+		testing.expect_value(t, serialized_frame.descriptor.version, frame.descriptor.version)
+
+		testing.expect_value(t, len(serialized_frame.blocks), len(frame.blocks))
+		if len(serialized_frame.blocks) == len(frame.blocks) {
+			for b, i in frame.blocks {
+				sb := serialized_frame.blocks[i]
+				testing.expect_value(t, sb.compressed, b.compressed)
+				testing.expect_value(t, sb.size, b.size)
+				testing.expect_value(t, sb.checksum, b.checksum)
+				testing.expect_value(t, bytes.compare(sb.data, b.data), 0)
+			}
+		}
+	}
+}
+
+Compress_Error :: union {
+	mem.Allocator_Error,
+	io.Error,
+}
+
+compress :: proc(data: []byte) -> (result: []byte, error: Compress_Error) {
+	return nil, nil
+}
+
+// @(test, private = "package")
+// test_compress :: proc(t: ^testing.T) {
+// 	context.logger = log.create_console_logger()
+//
+// 	path :: "test-data/plain-01.txt"
+// 	file_data, read_ok := os.read_entire_file_from_filename(path)
+// 	if !read_ok {
+// 		panic("Could not read file for test: '" + path + "'")
+// 	}
+//
+// 	compressed, compress_error := compress(file_data)
+// 	testing.expect(
+// 		t,
+// 		compress_error == nil,
+// 		fmt.tprintf("Compress error is not nil: %v\n", compress_error),
+// 	)
+// 	testing.expect(
+// 		t,
+// 		len(compressed) < len(file_data),
+// 		fmt.tprintf(
+// 			"Compressed data is not smaller than original: %d >= %d\n",
+// 			len(compressed),
+// 			len(file_data),
+// 		),
+// 	)
+// 	testing.expect(t, len(compressed) > 0, fmt.tprintf("Compressed data is empty\n"))
+//
+// 	frame, _, frame_error := frame_next(compressed)
+// 	testing.expect(t, frame_error == nil, fmt.tprintf("Frame error is not nil: %v\n", frame_error))
+// 	testing.expect(
+// 		t,
+// 		frame.descriptor.version == 1,
+// 		fmt.tprintf("Frame version is not 1: %d\n", frame.descriptor.version),
+// 	)
+//
+// 	decompressed, decompress_error := decompress_frame(frame)
+// 	testing.expect(
+// 		t,
+// 		decompress_error == nil,
+// 		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
+// 	)
+// 	switch d in decompressed {
+// 	case []byte:
+// 		testing.expect(
+// 			t,
+// 			bytes.compare(d, file_data) == 0,
+// 			fmt.tprintf("Decompressed data does not match original data: '%s'\n", d),
+// 		)
+// 	case [][]byte:
+// 		concatenated := bytes.concatenate(d)
+// 		testing.expect(
+// 			t,
+// 			bytes.compare(concatenated, file_data) == 0,
+// 			fmt.tprintf("Decompressed data does not match original data: '%s'\n", concatenated),
+// 		)
+// 	}
+// }
+
 get_block_max_size :: proc(byte: byte) -> int {
 	switch byte {
 	case 0, 1, 2, 3:
@@ -485,6 +763,21 @@ get_block_max_size :: proc(byte: byte) -> int {
 		return 4 * mem.Megabyte
 	case:
 		return -1
+	}
+}
+
+encode_block_max_size :: proc(size: int) -> byte {
+	switch size {
+	case 64 * mem.Kilobyte:
+		return 4
+	case 256 * mem.Kilobyte:
+		return 5
+	case mem.Megabyte:
+		return 6
+	case 4 * mem.Megabyte:
+		return 7
+	case:
+		return 0
 	}
 }
 

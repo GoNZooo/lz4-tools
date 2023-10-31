@@ -373,6 +373,7 @@ decompress_frame_dependently :: proc(
 	log.panicf("Block dependence not currently supported")
 }
 
+@(private = "file")
 read_data_block :: proc(
 	r: ^bytes.Reader,
 	allocator := context.allocator,
@@ -685,69 +686,345 @@ test_frame_serialize :: proc(t: ^testing.T) {
 Compress_Error :: union {
 	mem.Allocator_Error,
 	io.Error,
+	Compress_Block_Error,
 }
 
-compress :: proc(data: []byte) -> (result: []byte, error: Compress_Error) {
-	return nil, nil
+Max_Block_Size :: enum {
+	Kilobytes_64,
+	Kilobytes_256,
+	Megabyte,
+	Megabytes_4,
 }
 
-// @(test, private = "package")
-// test_compress :: proc(t: ^testing.T) {
-// 	context.logger = log.create_console_logger()
-//
-// 	path :: "test-data/plain-01.txt"
-// 	file_data, read_ok := os.read_entire_file_from_filename(path)
-// 	if !read_ok {
-// 		panic("Could not read file for test: '" + path + "'")
-// 	}
-//
-// 	compressed, compress_error := compress(file_data)
-// 	testing.expect(
-// 		t,
-// 		compress_error == nil,
-// 		fmt.tprintf("Compress error is not nil: %v\n", compress_error),
-// 	)
-// 	testing.expect(
-// 		t,
-// 		len(compressed) < len(file_data),
-// 		fmt.tprintf(
-// 			"Compressed data is not smaller than original: %d >= %d\n",
-// 			len(compressed),
-// 			len(file_data),
-// 		),
-// 	)
-// 	testing.expect(t, len(compressed) > 0, fmt.tprintf("Compressed data is empty\n"))
-//
-// 	frame, _, frame_error := frame_next(compressed)
-// 	testing.expect(t, frame_error == nil, fmt.tprintf("Frame error is not nil: %v\n", frame_error))
-// 	testing.expect(
-// 		t,
-// 		frame.descriptor.version == 1,
-// 		fmt.tprintf("Frame version is not 1: %d\n", frame.descriptor.version),
-// 	)
-//
-// 	decompressed, decompress_error := decompress_frame(frame)
-// 	testing.expect(
-// 		t,
-// 		decompress_error == nil,
-// 		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
-// 	)
-// 	switch d in decompressed {
-// 	case []byte:
-// 		testing.expect(
-// 			t,
-// 			bytes.compare(d, file_data) == 0,
-// 			fmt.tprintf("Decompressed data does not match original data: '%s'\n", d),
-// 		)
-// 	case [][]byte:
-// 		concatenated := bytes.concatenate(d)
-// 		testing.expect(
-// 			t,
-// 			bytes.compare(concatenated, file_data) == 0,
-// 			fmt.tprintf("Decompressed data does not match original data: '%s'\n", concatenated),
-// 		)
-// 	}
-// }
+max_block_size_int_value :: proc(max_block_size: Max_Block_Size) -> int {
+	switch max_block_size {
+	case .Kilobytes_64:
+		return 64 * mem.Kilobyte
+	case .Kilobytes_256:
+		return 256 * mem.Kilobyte
+	case .Megabyte:
+		return mem.Megabyte
+	case .Megabytes_4:
+		return 4 * mem.Megabyte
+	}
+
+	panic("Invalid max block size")
+}
+
+frame_header_serialize :: proc(
+	d: Frame_Descriptor,
+	allocator := context.allocator,
+) -> (
+	data: []byte,
+	error: io.Error,
+) {
+	b: bytes.Buffer
+	bytes.buffer_init_allocator(&b, 0, 0, allocator)
+
+	flags := u8(d.version << 6)
+	if d.block_independence {
+		flags |= 0x20
+	}
+	if d.has_block_checksum {
+		flags |= 0x10
+	}
+	if d.content_size != 0 {
+		flags |= 0x08
+	}
+	if d.has_content_checksum {
+		flags |= 0x04
+	}
+	if d.dictionary_id != 0 {
+		flags |= 0x01
+	}
+	bytes.buffer_write_byte(&b, flags) or_return
+
+	bd_byte := encode_block_max_size(d.block_max_size) << 4
+	bytes.buffer_write_byte(&b, bd_byte) or_return
+
+	if d.content_size != 0 {
+		content_size_bytes := transmute([8]byte)u64le(d.content_size)
+		bytes.buffer_write(&b, content_size_bytes[:]) or_return
+	}
+
+	if d.dictionary_id != 0 {
+		dictionary_id_bytes := transmute([4]byte)u32le(d.dictionary_id)
+		bytes.buffer_write(&b, dictionary_id_bytes[:]) or_return
+	}
+
+	header_bytes := bytes.buffer_to_bytes(&b)
+
+	return header_bytes, nil
+}
+
+// Produces a serialized LZ4 frame from the given data.
+compress :: proc(
+	data: []byte,
+	max_block_size: Max_Block_Size = Max_Block_Size.Megabytes_4,
+	allocator := context.allocator,
+) -> (
+	result: []byte,
+	error: Compress_Error,
+) {
+	b: bytes.Buffer
+	bytes.buffer_init_allocator(&b, 0, 0, allocator)
+
+	max_block_size_int := max_block_size_int_value(max_block_size)
+
+	frame: Frame
+	frame.descriptor.version = 1
+	frame.descriptor.block_independence = true
+	frame.descriptor.has_block_checksum = true
+	frame.descriptor.has_content_checksum = true
+	frame.descriptor.block_max_size = max_block_size_int
+	frame.descriptor.content_size = len(data)
+	frame.descriptor.dictionary_id = 0
+	header_bytes := frame_header_serialize(frame.descriptor) or_return
+	header_checksum := u8(xxhash.XXH32(header_bytes, 0) >> 8)
+	frame.descriptor.header_checksum = header_checksum
+	frame.content_checksum = u32le(xxhash.XXH32(data, 0))
+	frame.descriptor.calculated_checksum = header_checksum
+
+	number_of_blocks := len(data) / max_block_size_int
+	if len(data) % max_block_size_int != 0 {
+		number_of_blocks += 1
+	}
+
+	blocks := make([dynamic]Frame_Block, 0, number_of_blocks, allocator) or_return
+
+	for i in 0 ..< number_of_blocks {
+		start_index := i * max_block_size_int
+		end_index := start_index + max_block_size_int
+		if end_index > len(data) {
+			end_index = len(data)
+		}
+
+		block_data := data[start_index:end_index]
+
+		block: Frame_Block
+		block.compressed = true
+		block.data = compress_block(block_data, allocator) or_return
+		block.checksum = xxhash.XXH32(block.data, 0)
+		block.size = len(block.data)
+
+		append(&blocks, block) or_return
+	}
+
+	frame.blocks = blocks[:]
+
+	result = frame_serialize(frame, allocator) or_return
+
+	return result, nil
+}
+
+Token :: struct {
+	match:    Match,
+	literals: []byte,
+}
+
+Match :: struct {
+	index:  int,
+	length: int,
+}
+
+Compression_Context :: struct {
+	sequence_table: map[xxhash.XXH32_hash]Match,
+}
+
+compression_context_init :: proc(
+	allocator := context.allocator,
+) -> (
+	ctx: Compression_Context,
+	error: mem.Allocator_Error,
+) {
+	sequence_table := make(map[xxhash.XXH32_hash]Match, 0, allocator) or_return
+	ctx.sequence_table = sequence_table
+
+	return ctx, nil
+}
+
+Compress_Block_Error :: union {
+	mem.Allocator_Error,
+	io.Error,
+}
+
+compress_block :: proc(
+	data: []byte,
+	allocator := context.allocator,
+) -> (
+	result: []byte,
+	error: Compress_Block_Error,
+) {
+	ctx := compression_context_init(allocator) or_return
+
+	b: bytes.Buffer
+	bytes.buffer_init_allocator(&b, 0, 0, allocator)
+	last_token_index := 0
+
+	for i := 0; i < len(data); {
+		if i >= len(data) - 5 {
+			literals := data[i:]
+			token_byte := byte(len(literals) << 4)
+			bytes.buffer_write_byte(&b, token_byte) or_return
+
+			bytes.buffer_write(&b, literals) or_return
+
+			break
+		}
+
+		window_hash := xxhash.XXH32(data[i:i + 4], 0)
+		match, have_match := ctx.sequence_table[window_hash]
+		if !have_match {
+			ctx.sequence_table[window_hash] = Match {
+				index  = i,
+				length = 4,
+			}
+			i += 1
+			continue
+		}
+
+		m := match
+		for m.index + m.length < (len(data) - 12) {
+			if data[i + m.length] != data[m.index + m.length] {
+				break
+			}
+			m.length += 1
+		}
+
+		literals_length := i - last_token_index
+		literals := data[last_token_index:i]
+		match_length := m.length - 4
+
+		token_byte: byte
+		if literals_length >= 15 {
+			token_byte = 0xf0
+		} else {
+			token_byte = byte(literals_length << 4)
+		}
+		literals_length -= 15
+		if match_length >= 15 {
+			token_byte |= 0x0f
+		} else {
+			token_byte |= byte(match_length)
+		}
+		match_length -= 15
+		bytes.buffer_write_byte(&b, token_byte) or_return
+
+		for literals_length >= 255 {
+			literals_length -= 255
+			bytes.buffer_write_byte(&b, 0xff) or_return
+		}
+		if literals_length >= 0 {
+			bytes.buffer_write_byte(&b, byte(literals_length)) or_return
+		}
+
+		bytes.buffer_write(&b, literals) or_return
+
+		offset := u16le(i - m.index)
+		offset_bytes := transmute([2]byte)offset
+		bytes.buffer_write(&b, offset_bytes[:]) or_return
+
+		for match_length >= 255 {
+			match_length -= 255
+			bytes.buffer_write_byte(&b, 0xff) or_return
+		}
+		if match_length >= 0 {
+			bytes.buffer_write_byte(&b, byte(match_length)) or_return
+		}
+
+		last_token_index = i + m.length
+		i += m.length
+	}
+
+	result = bytes.buffer_to_bytes(&b)
+	log.debugf("len(result): %d", len(result))
+
+	return result, nil
+}
+
+@(test, private = "package")
+test_compress :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
+
+	path :: "test-data/plain-01.txt"
+	file_data, read_ok := os.read_entire_file_from_filename(path)
+	if !read_ok {
+		panic("Could not read file for test: '" + path + "'")
+	}
+
+	compressed, compress_error := compress(file_data)
+	testing.expect(
+		t,
+		compress_error == nil,
+		fmt.tprintf("Compress error is not nil: %v\n", compress_error),
+	)
+	testing.expect(
+		t,
+		len(compressed) < len(file_data),
+		fmt.tprintf(
+			"Compressed data is not smaller than original: %d >= %d\n",
+			len(compressed),
+			len(file_data),
+		),
+	)
+	testing.expect(t, len(compressed) > 0, fmt.tprintf("Compressed data is empty\n"))
+
+	frame, _, frame_error := frame_next(compressed)
+	testing.expect(t, frame_error == nil, fmt.tprintf("Frame error is not nil: %v\n", frame_error))
+	testing.expect(
+		t,
+		frame.descriptor.version == 1,
+		fmt.tprintf("Frame version is not 1: %d\n", frame.descriptor.version),
+	)
+
+	decompressed, decompress_error := decompress_frame(frame)
+	testing.expect(
+		t,
+		decompress_error == nil,
+		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
+	)
+	switch d in decompressed {
+	case []byte:
+		testing.expect(
+			t,
+			bytes.compare(d, file_data) == 0,
+			fmt.tprintf("Decompressed data does not match original data: '%s'\n", d),
+		)
+	case [][]byte:
+		concatenated := bytes.concatenate(d)
+		content_checksum := xxhash.XXH32(concatenated, 0)
+		concatenated_length := len(concatenated)
+		testing.expect(
+			t,
+			concatenated_length == frame.descriptor.content_size,
+			fmt.tprintf(
+				"Content size mismatch: %d != %d\n",
+				concatenated_length,
+				frame.descriptor.content_size,
+			),
+		)
+		if concatenated_length == frame.descriptor.content_size {
+			testing.expect(
+				t,
+				u32le(content_checksum) == frame.content_checksum,
+				fmt.tprintf(
+					"Content checksum mismatch: %d != %d\n",
+					content_checksum,
+					frame.content_checksum,
+				),
+			)
+			compare_result := bytes.compare(concatenated, file_data)
+			testing.expect(
+				t,
+				compare_result == 0,
+				fmt.tprintf(
+					"Decompressed data does not match original data: '%s'\n",
+					concatenated,
+				),
+			)
+		}
+	}
+}
 
 get_block_max_size :: proc(byte: byte) -> int {
 	switch byte {

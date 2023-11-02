@@ -36,11 +36,13 @@ Frame_Block :: struct {
 	compressed: bool,
 }
 
-FrameNextError :: union {
+Frame_Next_Error :: union {
 	No_Frame,
 	Data_Too_Small,
 	Infinite_Frame,
+	Read_Frame_Block_Error,
 	mem.Allocator_Error,
+	io.Error,
 }
 
 No_Frame :: struct {}
@@ -60,27 +62,29 @@ frame_next :: proc(
 ) -> (
 	frame: Frame,
 	rest: []byte,
-	error: FrameNextError,
+	error: Frame_Next_Error,
 ) {
 	if len(data) < 7 {
 		return Frame{}, data, Data_Too_Small{size = len(data)}
 	}
+
+	r: bytes.Reader
+	bytes.reader_init(&r, data)
 
 	for i := 0; i < len(data); i += 1 {
 		if i + 4 > len(data) {
 			return Frame{}, data, No_Frame{}
 		}
 
-		potential_magic_value := mem.reinterpret_copy(u32le, raw_data(data[i:i + 4]))
+		magic_value_buffer: [4]byte
+		bytes.reader_read(&r, magic_value_buffer[:]) or_return
+		potential_magic_value := transmute(u32le)magic_value_buffer
 
 		if potential_magic_value != MAGIC_VALUE {
 			continue
 		}
 
-		// TODO(gonz): convert this to `Reader` instead
-
-		ix := i + 4
-		flags := data[ix]
+		flags := bytes.reader_read_byte(&r) or_return
 		version := int(flags >> 6)
 		block_independence := flags & 0x20 != 0
 		has_block_checksum := flags & 0x10 != 0
@@ -88,11 +92,8 @@ frame_next :: proc(
 		has_content_checksum := flags & 0x04 != 0
 		has_dictionary_id := flags & 0x01 != 0
 
-		ix += 1
-		bd := data[ix]
-		block_max_size := get_block_max_size(bd & 0x70 >> 4)
-
-		ix += 1
+		bd := bytes.reader_read_byte(&r) or_return
+		block_max_size := get_block_max_size((bd & 0x70) >> 4)
 
 		frame.descriptor.version = version
 		frame.descriptor.block_independence = block_independence
@@ -100,83 +101,103 @@ frame_next :: proc(
 		frame.descriptor.has_content_checksum = has_content_checksum
 		frame.descriptor.block_max_size = block_max_size
 
-		content_size := has_content_size ? mem.reinterpret_copy(int, raw_data(data[ix:ix + 8])) : 0
-		frame.descriptor.content_size = content_size
+		content_size: int
 		if has_content_size {
-			ix += 8
+			content_size_buffer: [8]byte
+			bytes.reader_read(&r, content_size_buffer[:]) or_return
+			content_size = transmute(int)content_size_buffer
 		}
+		frame.descriptor.content_size = content_size
 
-		dictionary_id :=
-			has_dictionary_id ? mem.reinterpret_copy(i32, raw_data(data[ix:ix + 4])) : 0
-		frame.descriptor.dictionary_id = int(dictionary_id)
+		dictionary_id: i32
 		if has_dictionary_id {
-			ix += 4
+			dictionary_id_buffer: [4]byte
+			bytes.reader_read(&r, dictionary_id_buffer[:]) or_return
+			dictionary_id = transmute(i32)dictionary_id_buffer
 		}
 
-		header_checksum := data[ix]
+		header_checksum := bytes.reader_read_byte(&r) or_return
 		frame.descriptor.header_checksum = header_checksum
 
-		header_bytes := data[i + 4:ix]
+		header_bytes := data[i + 4:r.i - 1]
 		checksum := u8(xxhash.XXH32(header_bytes, 0) >> 8)
 		if checksum != header_checksum {
-			log.errorf("Checksum mismatch: %d != %d", checksum, header_checksum)
+			log.errorf("Checksum mismatch: %#x != %#x", checksum, header_checksum)
 		}
 		frame.descriptor.calculated_checksum = checksum
 
-		ix += 1
-
-		blocks := make([dynamic]Frame_Block, 0, 0, allocator) or_return
-
-		for {
-			is_compressed := data[ix] & 0x80 != 0
-			block_size := mem.reinterpret_copy(u32le, raw_data(data[ix:ix + 4]))
-			if block_size == 0 {
-				break
-			}
-
-			block_size &= 0x7F_FF_FF_FF
-			ix += 4
-
-			block := Frame_Block{}
-			block.size = int(block_size)
-			block.compressed = is_compressed
-			block.data = data[ix:ix + block.size]
-			ix += block.size
-			if has_block_checksum {
-				block.checksum = mem.reinterpret_copy(u32, raw_data(data[ix:ix + 4]))
-				assert(
-					block.checksum == xxhash.XXH32(block.data, 0),
-					fmt.tprintf(
-						"Block checksum mismatch: %d != %d",
-						block.checksum,
-						xxhash.XXH32(block.data, 0),
-					),
-				)
-				ix += 4
-			}
-
-			append(&blocks, block) or_return
-		}
-		frame.blocks = blocks[:]
-
-		end_marker_value := mem.reinterpret_copy(u32le, raw_data(data[ix:ix + 4]))
-		assert(
-			end_marker_value == 0,
-			fmt.tprintf("End marker bytes are not 0: %d", end_marker_value),
-		)
-		ix += 4
+		frame.blocks = read_frame_blocks(&r, has_block_checksum, allocator) or_return
 
 		if has_content_checksum {
-			frame.content_checksum = mem.reinterpret_copy(u32le, raw_data(data[ix:ix + 4]))
-			ix += 4
+			content_checksum_buffer: [4]byte
+			bytes.reader_read(&r, content_checksum_buffer[:]) or_return
+			frame.content_checksum = transmute(u32le)content_checksum_buffer
 		}
 
-		rest = data[ix:]
+		rest = data[r.i:]
 
 		return frame, rest, nil
 	}
 
 	return Frame{}, nil, No_Frame{}
+}
+
+Read_Frame_Block_Error :: union {
+	io.Error,
+	mem.Allocator_Error,
+}
+
+@(private = "file")
+read_frame_blocks :: proc(
+	r: ^bytes.Reader,
+	has_checksum: bool,
+	allocator := context.allocator,
+) -> (
+	blocks: []Frame_Block,
+	error: Read_Frame_Block_Error,
+) {
+	frame_blocks := make([dynamic]Frame_Block, 0, 0, allocator) or_return
+
+	for {
+		block_size_buffer: [4]byte
+		n := bytes.reader_read(r, block_size_buffer[:]) or_return
+		assert(n == 4)
+		compressed := block_size_buffer[0] & 0x80 != 0
+		size := transmute(i32)block_size_buffer & 0x7f_ff_ff_ff
+		if size == 0 {
+			break
+		}
+
+		data := make([]byte, size, allocator) or_return
+		n = bytes.reader_read(r, data) or_return
+		assert(n == int(size))
+
+		checksum: u32le
+		if has_checksum {
+			checksum_buffer: [4]byte
+			n = bytes.reader_read(r, checksum_buffer[:]) or_return
+			assert(n == 4)
+			checksum = transmute(u32le)checksum_buffer
+		}
+
+		block := Frame_Block {
+			size       = int(size),
+			data       = data,
+			checksum   = u32(checksum),
+			compressed = compressed,
+		}
+
+		append(&frame_blocks, block) or_return
+
+		possible_end_marker_buffer: [4]byte
+		bytes.reader_read(r, possible_end_marker_buffer[:]) or_return
+		possible_end_marker := transmute(u32le)possible_end_marker_buffer
+		if possible_end_marker == 0 {
+			break
+		}
+	}
+
+	return frame_blocks[:], nil
 }
 
 Data_Block :: struct {
@@ -289,7 +310,8 @@ decompress_frame_block :: proc(
 				}
 		}
 
-		bytes.buffer_write(&b, db.literals) or_return
+		n := bytes.buffer_write(&b, db.literals) or_return
+		assert(n == db.length)
 
 		if db.offset == 0 {
 			continue
@@ -298,18 +320,20 @@ decompress_frame_block :: proc(
 		if db.offset < db.match_length {
 			copy_start := len(b.buf) - db.offset
 			copy_bytes := b.buf[copy_start:]
-			bytes.buffer_write(&b, copy_bytes) or_return
+			copy_n := bytes.buffer_write(&b, copy_bytes) or_return
 
 			remaining := db.match_length - db.offset
-			for remaining > 0 {
-				bytes.buffer_write_byte(&b, copy_bytes[len(copy_bytes) - 1]) or_return
-				remaining -= 1
+			for i in 0 ..< remaining {
+				bytes.buffer_write_byte(&b, copy_bytes[i % len(copy_bytes)]) or_return
 			}
 		} else {
 			match_start := len(b.buf) - db.offset
+			assert(match_start >= 0 && match_start <= len(b.buf), "match_start is out of bounds")
 			match_end := match_start + db.match_length
+			assert(match_end >= 0 && match_end <= len(b.buf), "match_end is out of bounds")
 			match_bytes := b.buf[match_start:match_end]
-			bytes.buffer_write(&b, match_bytes) or_return
+			match_n := bytes.buffer_write(&b, match_bytes) or_return
+			assert(match_n == db.match_length)
 		}
 	}
 
@@ -320,18 +344,32 @@ decompress_frame_block :: proc(
 
 @(test, private = "package")
 test_decompress_frame :: proc(t: ^testing.T) {
-	context.logger = log.create_console_logger()
+	expect_decompress_frame_invariants_to_hold(
+		t,
+		"test-data/plain-01-checksum.lz4",
+		"test-data/plain-01.txt",
+	)
+	expect_decompress_frame_invariants_to_hold(
+		t,
+		"test-data/lz4-2023-11-01.odin.lz4",
+		"test-data/lz4-2023-11-01.odin",
+	)
+}
 
-	path :: "test-data/plain-01-checksum.lz4"
-	file_data, read_ok := os.read_entire_file_from_filename(path)
+expect_decompress_frame_invariants_to_hold :: proc(
+	t: ^testing.T,
+	compressed_path, plain_text_path: string,
+) {
+	context.logger = log.create_console_logger(ident = fmt.tprintf("%s", compressed_path))
+
+	file_data, read_ok := os.read_entire_file_from_filename(compressed_path)
 	if !read_ok {
-		panic("Could not read file for test: '" + path + "'")
+		fmt.panicf("Could not read file for test: '%s'", compressed_path)
 	}
 
-	plain_text_path :: "test-data/plain-01.txt"
 	plain_data, plain_read_ok := os.read_entire_file_from_filename(plain_text_path)
 	if !plain_read_ok {
-		panic("Could not read file for test: '" + plain_text_path + "'")
+		fmt.panicf("Could not read file for test: '%s'", plain_text_path)
 	}
 
 	frame, _, frame_error := frame_next(file_data)
@@ -346,20 +384,56 @@ test_decompress_frame :: proc(t: ^testing.T) {
 		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
 	)
 
+	compare_result: int
+	buffer: []byte
 	switch d in decompressed {
 	case []byte:
+		compare_result = bytes.compare(d, plain_data)
+		buffer = d
 		testing.expect(
 			t,
-			bytes.compare(d, plain_data) == 0,
-			fmt.tprintf("Decompressed data does not match plain data: '%s'\n", d),
+			compare_result == 0,
+			fmt.tprintf("Decompressed data does not match plain data\n"),
 		)
 	case [][]byte:
 		concatenated := bytes.concatenate(d)
+		buffer = concatenated
+		compare_result = bytes.compare(concatenated, plain_data)
 		testing.expect(
 			t,
-			bytes.compare(concatenated, plain_data) == 0,
-			fmt.tprintf("Decompressed data does not match plain data: '%s'\n", concatenated),
+			compare_result == 0,
+			fmt.tprintf("Decompressed data does not match plain data\n"),
 		)
+	}
+
+	if compare_result != 0 {
+		plain_length := len(plain_data)
+		decompressed_length := len(buffer)
+		if plain_length != decompressed_length {
+			fmt.panicf(
+				"Decompressed data does not match plain data:\n\tLengths do not match: %d != %d\n",
+				plain_length,
+				decompressed_length,
+			)
+		}
+
+		for pc, i in plain_data {
+			dc := buffer[i]
+			if pc != dc {
+				decompressed: [50]byte
+				plaintext: [50]byte
+				copy(decompressed[:], buffer[i - 25:])
+				copy(plaintext[:], plain_data[i - 25:])
+				fmt.panicf(
+					"Mismatch @ %d: %#x != %#x\n\n\tPlain:\n\t '%s'\nDecompressed:\n\t'%s'\n",
+					i,
+					pc,
+					dc,
+					plaintext,
+					decompressed,
+				)
+			}
+		}
 	}
 }
 
@@ -382,12 +456,13 @@ read_data_block :: proc(
 	error: Data_Block_Error,
 ) {
 	token_byte := bytes.reader_read_byte(r) or_return
-	last_read_length := int(token_byte >> 4)
-	block.length = last_read_length
-	for last_read_length == 15 || last_read_length == 255 {
+	initial_read := token_byte >> 4
+	block.length = int(initial_read)
+	last_read_length: byte = 255
+	for initial_read == 15 && last_read_length == 255 {
 		b := bytes.reader_read_byte(r) or_return
-		last_read_length = int(b)
-		block.length += last_read_length
+		last_read_length = b
+		block.length += int(last_read_length)
 	}
 
 	if block.length == 0 {
@@ -396,32 +471,31 @@ read_data_block :: proc(
 		literals := make([]byte, block.length, allocator) or_return
 
 		literal_bytes_read := bytes.reader_read(r, literals) or_return
-		if literal_bytes_read != block.length {
-			return Data_Block{},
-				Not_Enough_Literals{expected = block.length, actual = literal_bytes_read}
-		}
+		assert(literal_bytes_read == block.length)
 
 		block.literals = literals
 	}
 
 	offset_buffer: [2]byte
-	_, offset_read := bytes.reader_read(r, offset_buffer[:])
+	offset_bytes_read, offset_read := bytes.reader_read(r, offset_buffer[:])
 	if offset_read == .EOF {
 		// This means we've read the last block, we have only literals and no offset
 		return block, nil
 	}
+	assert(offset_bytes_read == 2)
 	offset := transmute(u16le)offset_buffer
 	if offset == 0 {
 		return Data_Block{}, Zero_Offset{position = int(r.i)}
 	}
 	block.offset = int(offset)
 
-	last_read_length = int(token_byte & 0x0f)
-	block.match_length = last_read_length
-	for last_read_length == 15 || last_read_length == 255 {
+	initial_read = token_byte & 0x0f
+	block.match_length = int(initial_read)
+	last_read_length = 255
+	for initial_read == 15 && last_read_length == 255 {
 		b := bytes.reader_read_byte(r) or_return
-		last_read_length = int(b)
-		block.match_length += last_read_length
+		last_read_length = b
+		block.match_length += int(last_read_length)
 	}
 	block.match_length += 4
 
@@ -873,8 +947,8 @@ compress_block :: proc(
 		}
 
 		window_hash := xxhash.XXH32(data[i:i + 4], 0)
-		match, have_match := ctx.sequence_table[window_hash]
-		if !have_match {
+		match, have_match := &ctx.sequence_table[window_hash]
+		if !have_match || bytes.compare(data[i:i + 4], data[match.index:match.index + 4]) != 0 {
 			ctx.sequence_table[window_hash] = Match {
 				index  = i,
 				length = 4,
@@ -883,7 +957,7 @@ compress_block :: proc(
 			continue
 		}
 
-		m := match
+		m := match^
 		for m.index + m.length < (len(data) - 12) {
 			if data[i + m.length] != data[m.index + m.length] {
 				break
@@ -892,8 +966,13 @@ compress_block :: proc(
 		}
 
 		literals_length := i - last_token_index
+		assert(
+			literals_length >= 0,
+			fmt.tprintf("literals_length is negative: %d", literals_length),
+		)
 		literals := data[last_token_index:i]
 		match_length := m.length - 4
+		assert(match_length >= 0, fmt.tprintf("match_length is negative: %d", match_length))
 
 		token_byte: byte
 		if literals_length >= 15 {
@@ -902,10 +981,11 @@ compress_block :: proc(
 			token_byte = byte(literals_length << 4)
 		}
 		literals_length -= 15
+
 		if match_length >= 15 {
 			token_byte |= 0x0f
 		} else {
-			token_byte |= byte(match_length)
+			token_byte |= byte(match_length) & 0x0f
 		}
 		match_length -= 15
 		bytes.buffer_write_byte(&b, token_byte) or_return
@@ -921,6 +1001,19 @@ compress_block :: proc(
 		bytes.buffer_write(&b, literals) or_return
 
 		offset := u16le(i - m.index)
+		assert(offset != 0, "Offset is 0")
+		assert(
+			int(offset) <= i,
+			fmt.tprintf("Offset is longer than we've passed through data: %d", offset),
+		)
+		assert(
+			data[i] == data[i - int(offset)],
+			fmt.tprintf(
+				"data[i] != data[i - int(offset)]: %d != %d",
+				data[i],
+				data[i - int(offset)],
+			),
+		)
 		offset_bytes := transmute([2]byte)offset
 		bytes.buffer_write(&b, offset_bytes[:]) or_return
 
@@ -942,14 +1035,18 @@ compress_block :: proc(
 	return result, nil
 }
 
-@(test, private = "package")
-test_compress :: proc(t: ^testing.T) {
-	context.logger = log.create_console_logger()
+// @(test, private = "package")
+// test_compress :: proc(t: ^testing.T) {
+// 	expect_compression_invariants_to_hold(t, "test-data/plain-01.txt")
+// 	expect_compression_invariants_to_hold(t, "test-data/lz4-2023-11-01.odin")
+// }
 
-	path :: "test-data/plain-01.txt"
+expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
+	// id := rand.uint32()
+	context.logger = log.create_console_logger(ident = path)
 	file_data, read_ok := os.read_entire_file_from_filename(path)
 	if !read_ok {
-		panic("Could not read file for test: '" + path + "'")
+		fmt.panicf("Could not read file for test: '%s'", path)
 	}
 
 	compressed, compress_error := compress(file_data)
@@ -1056,30 +1153,4 @@ encode_block_max_size :: proc(size: int) -> byte {
 	case:
 		return 0
 	}
-}
-
-@(test, private = "package")
-test_frame_next :: proc(t: ^testing.T) {
-	context.logger = log.create_console_logger()
-	path :: "test-data/lz4-example.pak"
-
-	file_data, ok := os.read_entire_file_from_filename(path)
-	if !ok {
-		panic("Could not read file for test: '" + path + "'")
-	}
-	frames, alloc_error := make([dynamic]Frame, 0, 0)
-	if alloc_error != nil {
-		panic("Could not allocate frames array")
-	}
-
-	for frame, rest, frame_error := frame_next(file_data);
-	    frame_error == nil;
-	    frame, rest, frame_error = frame_next(rest) {
-		_, err := append(&frames, frame)
-		if err != nil {
-			panic("Could not append frame")
-		}
-	}
-
-	testing.expect_value(t, len(frames), 12)
 }

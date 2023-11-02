@@ -46,5 +46,13 @@ tasks:
     method: none
     silent: true
 
+  debug_test_lz4:
+    cmds:
+      - gdb bin/lz4-test
+    method: none
+    silent: true
+    aliases:
+      - dt
+
 interval: 100ms
 

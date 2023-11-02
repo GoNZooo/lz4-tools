@@ -958,6 +958,9 @@ compress_block :: proc(
 		}
 
 		m := match^
+		// TODO(gonz): see if we can move the match index forward here and still retain the same
+		// output. This should make it so that we are more likely to hit already cached data(?) and
+		// should be faster overall.
 		for m.index + m.length < (len(data) - 12) {
 			if data[i + m.length] != data[m.index + m.length] {
 				break
@@ -1035,14 +1038,13 @@ compress_block :: proc(
 	return result, nil
 }
 
-// @(test, private = "package")
-// test_compress :: proc(t: ^testing.T) {
-// 	expect_compression_invariants_to_hold(t, "test-data/plain-01.txt")
-// 	expect_compression_invariants_to_hold(t, "test-data/lz4-2023-11-01.odin")
-// }
+@(test, private = "package")
+test_compress :: proc(t: ^testing.T) {
+	expect_compression_invariants_to_hold(t, "test-data/plain-01.txt")
+	expect_compression_invariants_to_hold(t, "test-data/lz4-2023-11-01.odin")
+}
 
 expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
-	// id := rand.uint32()
 	context.logger = log.create_console_logger(ident = path)
 	file_data, read_ok := os.read_entire_file_from_filename(path)
 	if !read_ok {

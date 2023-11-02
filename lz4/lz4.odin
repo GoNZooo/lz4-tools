@@ -162,8 +162,9 @@ read_frame_blocks :: proc(
 		block_size_buffer: [4]byte
 		n := bytes.reader_read(r, block_size_buffer[:]) or_return
 		assert(n == 4)
-		compressed := block_size_buffer[0] & 0x80 != 0
-		size := transmute(i32)block_size_buffer & 0x7f_ff_ff_ff
+		block_size := transmute(u32)block_size_buffer
+		compressed := block_size & 0x8000_0000 == 0
+		size := block_size & 0x7f_ff_ff_ff
 		if size == 0 {
 			break
 		}
@@ -344,16 +345,25 @@ decompress_frame_block :: proc(
 
 @(test, private = "package")
 test_decompress_frame :: proc(t: ^testing.T) {
-	expect_decompress_frame_invariants_to_hold(
-		t,
-		"test-data/plain-01-checksum.lz4",
-		"test-data/plain-01.txt",
-	)
-	expect_decompress_frame_invariants_to_hold(
-		t,
-		"test-data/lz4-2023-11-01.odin.lz4",
-		"test-data/lz4-2023-11-01.odin",
-	)
+	Test_Case :: struct {
+		compressed_path: string,
+		plain_text_path: string,
+	}
+
+	cases := []Test_Case{
+		{"test-data/plain-01-checksum.lz4", "test-data/plain-01.txt"},
+		{"test-data/lz4-2023-11-01.odin.lz4", "test-data/lz4-2023-11-01.odin"},
+		{"test-data/odin/core/os/os_windows.odin.lz4", "test-data/odin/core/os/os_windows.odin"},
+		{"test-data/odin/core/os/os_darwin.odin.lz4", "test-data/odin/core/os/os_darwin.odin"},
+		{"test-data/odin/core/os/os_linux.odin.lz4", "test-data/odin/core/os/os_linux.odin"},
+		{"test-data/odin/core/os/os_freebsd.odin.lz4", "test-data/odin/core/os/os_freebsd.odin"},
+		{"test-data/odin/core/os/os_openbsd.odin.lz4", "test-data/odin/core/os/os_openbsd.odin"},
+	}
+
+	for c in cases {
+		expect_decompress_frame_invariants_to_hold(t, c.compressed_path, c.plain_text_path)
+	}
+
 }
 
 expect_decompress_frame_invariants_to_hold :: proc(
@@ -961,7 +971,7 @@ compress_block :: proc(
 		// TODO(gonz): see if we can move the match index forward here and still retain the same
 		// output. This should make it so that we are more likely to hit already cached data(?) and
 		// should be faster overall.
-		for m.index + m.length < (len(data) - 12) {
+		for m.index + m.length < (len(data) - 12) && i + m.length < (len(data) - 12) {
 			if data[i + m.length] != data[m.index + m.length] {
 				break
 			}
@@ -1040,8 +1050,19 @@ compress_block :: proc(
 
 @(test, private = "package")
 test_compress :: proc(t: ^testing.T) {
-	expect_compression_invariants_to_hold(t, "test-data/plain-01.txt")
-	expect_compression_invariants_to_hold(t, "test-data/lz4-2023-11-01.odin")
+	files := []string{
+		"test-data/plain-01.txt",
+		"test-data/lz4-2023-11-01.odin",
+		"test-data/odin/core/os/os_windows.odin",
+		"test-data/odin/core/os/os_darwin.odin",
+		"test-data/odin/core/os/os_linux.odin",
+		"test-data/odin/core/os/os_freebsd.odin",
+		"test-data/odin/core/os/os_openbsd.odin",
+	}
+
+	for f in files {
+		expect_compression_invariants_to_hold(t, f)
+	}
 }
 
 expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {

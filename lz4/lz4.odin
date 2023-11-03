@@ -980,9 +980,10 @@ compress_block :: proc(
 		}
 
 		m := match^
-		// TODO(gonz): see if we can move the match index forward here and still retain the same
-		// output. This should make it so that we are more likely to hit already cached data(?) and
-		// should be faster overall.
+		// NOTE: this should move what is technically the same match further forward in the data
+		// which means we have a better chance of sharing cache space with the data we are already
+		// processing(?)
+		match.index = i
 		for m.index + m.length < (len(data) - 12) && i + m.length < (len(data) - 12) {
 			if data[i + m.length] != data[m.index + m.length] {
 				break

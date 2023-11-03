@@ -7,6 +7,8 @@ import "core:io"
 import "core:log"
 import "core:mem"
 import "core:os"
+import "core:path/filepath"
+import "core:slice"
 import "core:testing"
 
 MAGIC_VALUE :: 0x184D2204
@@ -350,36 +352,35 @@ test_decompress_frame :: proc(t: ^testing.T) {
 		plain_text_path: string,
 	}
 
-	cases := []Test_Case{
-		{"test-data/plain-01-checksum.lz4", "test-data/plain-01.txt"},
-		{"test-data/lz4-2023-11-01.odin.lz4", "test-data/lz4-2023-11-01.odin"},
-		{"test-data/odin/core/os/os_windows.odin.lz4", "test-data/odin/core/os/os_windows.odin"},
-		{"test-data/odin/core/os/os_darwin.odin.lz4", "test-data/odin/core/os/os_darwin.odin"},
-		{"test-data/odin/core/os/os_linux.odin.lz4", "test-data/odin/core/os/os_linux.odin"},
-		{"test-data/odin/core/os/os_freebsd.odin.lz4", "test-data/odin/core/os/os_freebsd.odin"},
-		{"test-data/odin/core/os/os_openbsd.odin.lz4", "test-data/odin/core/os/os_openbsd.odin"},
+	paths := []string{
+		"test-data/plain-01.txt",
+		"test-data/lz4-2023-11-01.odin",
+		"test-data/odin/core/os/os_windows.odin",
+		"test-data/odin/core/os/os_darwin.odin",
+		"test-data/odin/core/os/os_linux.odin",
+		"test-data/odin/core/os/os_freebsd.odin",
+		"test-data/odin/core/os/os_openbsd.odin",
 	}
 
-	for c in cases {
-		expect_decompress_frame_invariants_to_hold(t, c.compressed_path, c.plain_text_path)
+	for path in paths {
+		expect_decompress_frame_invariants_to_hold(t, path)
 	}
 
 }
 
-expect_decompress_frame_invariants_to_hold :: proc(
-	t: ^testing.T,
-	compressed_path, plain_text_path: string,
-) {
-	context.logger = log.create_console_logger(ident = fmt.tprintf("%s", compressed_path))
+
+expect_decompress_frame_invariants_to_hold :: proc(t: ^testing.T, path: string) {
+	context.logger = log.create_console_logger(ident = fmt.tprintf("%s", path))
+	compressed_path := fmt.tprintf("%s.lz4", path)
 
 	file_data, read_ok := os.read_entire_file_from_filename(compressed_path)
 	if !read_ok {
 		fmt.panicf("Could not read file for test: '%s'", compressed_path)
 	}
 
-	plain_data, plain_read_ok := os.read_entire_file_from_filename(plain_text_path)
+	plain_data, plain_read_ok := os.read_entire_file_from_filename(path)
 	if !plain_read_ok {
-		fmt.panicf("Could not read file for test: '%s'", plain_text_path)
+		fmt.panicf("Could not read file for test: '%s'", path)
 	}
 
 	frame, _, frame_error := frame_next(file_data)
@@ -667,7 +668,7 @@ write_frame_blocks :: proc(
 test_frame_serialize :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
 
-	path :: "test-data/plain-01-checksum.lz4"
+	path :: "test-data/plain-01.txt.lz4"
 	file_data, read_ok := os.read_entire_file_from_filename(path)
 	if !read_ok {
 		panic("Could not read file for test: '" + path + "'")
@@ -891,6 +892,15 @@ compress :: proc(
 		block.checksum = xxhash.XXH32(block.data, 0)
 		block.size = len(block.data)
 
+		savings := (f64(1) - f64(len(block.data)) / f64(len(block_data))) * 100
+		log.debugf(
+			"Block #%d savings: %.2f%% (original=%d, compressed=%d)",
+			i,
+			savings,
+			len(block_data),
+			len(block.data),
+		)
+
 		append(&blocks, block) or_return
 	}
 
@@ -947,7 +957,7 @@ compress_block :: proc(
 
 	for i := 0; i < len(data); {
 		if i >= len(data) - 5 {
-			literals := data[i:]
+			literals := data[last_token_index:]
 			token_byte := byte(len(literals) << 4)
 			bytes.buffer_write_byte(&b, token_byte) or_return
 
@@ -958,7 +968,9 @@ compress_block :: proc(
 
 		window_hash := xxhash.XXH32(data[i:i + 4], 0)
 		match, have_match := &ctx.sequence_table[window_hash]
-		if !have_match || bytes.compare(data[i:i + 4], data[match.index:match.index + 4]) != 0 {
+		if !have_match ||
+		   i - match.index >= 65_536 ||
+		   bytes.compare(data[i:i + 4], data[match.index:match.index + 4]) != 0 {
 			ctx.sequence_table[window_hash] = Match {
 				index  = i,
 				length = 4,
@@ -1022,9 +1034,12 @@ compress_block :: proc(
 		assert(
 			data[i] == data[i - int(offset)],
 			fmt.tprintf(
-				"data[i] != data[i - int(offset)]: %d != %d",
+				"data[i] != data[i - int(offset)]: %c != %c (i=%d, offset=%d, m.index=%d)",
 				data[i],
 				data[i - int(offset)],
+				i,
+				offset,
+				m.index,
 			),
 		)
 		offset_bytes := transmute([2]byte)offset
@@ -1043,7 +1058,6 @@ compress_block :: proc(
 	}
 
 	result = bytes.buffer_to_bytes(&b)
-	log.debugf("len(result): %d", len(result))
 
 	return result, nil
 }
@@ -1060,9 +1074,48 @@ test_compress :: proc(t: ^testing.T) {
 		"test-data/odin/core/os/os_openbsd.odin",
 	}
 
-	for f in files {
+	large_files, _ := all_files_in_directory("test-data/large-odin-files")
+
+	all_files := slice.concatenate([][]string{files, large_files})
+
+	for f in all_files {
 		expect_compression_invariants_to_hold(t, f)
 	}
+}
+
+@(private = "file")
+_all_files_walk_proc :: proc(
+	info: os.File_Info,
+	in_err: os.Errno,
+	user_data: rawptr,
+) -> (
+	err: os.Errno,
+	skip_dir: bool,
+) {
+	if !info.is_dir {
+		files := cast(^[dynamic]string)user_data
+		append(files, info.fullpath)
+	}
+
+	return err, skip_dir
+}
+
+@(private = "file")
+all_files_in_directory :: proc(
+	path: string,
+	allocator := context.allocator,
+) -> (
+	paths: []string,
+	error: mem.Allocator_Error,
+) {
+	files := make([dynamic]string, 0, 0, allocator) or_return
+
+	walk_result := filepath.walk(path, _all_files_walk_proc, &files)
+	if walk_result != os.ERROR_NONE {
+		fmt.panicf("Could not walk directory '%s': %v", path, walk_result)
+	}
+
+	return files[:], nil
 }
 
 expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
@@ -1123,6 +1176,17 @@ expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
 				frame.descriptor.content_size,
 			),
 		)
+
+		if concatenated_length != frame.descriptor.content_size {
+			concatenated_end: [25]byte
+			copy(concatenated_end[:], concatenated[len(concatenated) - 25:])
+			file_end: [25]byte
+			copy(file_end[:], file_data[len(file_data) - 25:])
+
+			fmt.printf("Concatenated end:\n'''\n%s\n'''\n", concatenated_end)
+			fmt.printf("File end:\n'''\n%s\n'''\n", file_end)
+		}
+
 		if concatenated_length == frame.descriptor.content_size {
 			testing.expect(
 				t,

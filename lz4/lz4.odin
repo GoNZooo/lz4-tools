@@ -1064,6 +1064,8 @@ compress_block :: proc(
 
 @(test, private = "package")
 test_compress :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
+
 	files := []string{
 		"test-data/plain-01.txt",
 		"test-data/lz4-2023-11-01.odin",
@@ -1078,9 +1080,13 @@ test_compress :: proc(t: ^testing.T) {
 
 	all_files := slice.concatenate([][]string{files, large_files})
 
+	count := 0
 	for f in all_files {
 		expect_compression_invariants_to_hold(t, f)
+		count += 1
 	}
+
+	log.infof("Compressed %d files", count)
 }
 
 @(private = "file")
@@ -1120,6 +1126,17 @@ all_files_in_directory :: proc(
 
 expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
 	context.logger = log.create_console_logger(ident = path)
+	path := path
+	if filepath.is_abs(path) {
+		cwd := os.get_current_directory()
+		relative_path, relative_path_error := filepath.rel(cwd, path)
+		if relative_path_error != nil {
+			fmt.panicf("Could not get relative path: %v", relative_path_error)
+		}
+		path = relative_path
+	}
+	context.logger = log.create_console_logger(ident = path)
+
 	file_data, read_ok := os.read_entire_file_from_filename(path)
 	if !read_ok {
 		fmt.panicf("Could not read file for test: '%s'", path)

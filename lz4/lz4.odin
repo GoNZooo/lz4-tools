@@ -1078,7 +1078,7 @@ test_compress :: proc(t: ^testing.T) {
 		"test-data/odin/core/os/os_openbsd.odin",
 	}
 
-	large_files, _ := all_files_in_directory("test-data/large-odin-files")
+	large_files, _ := all_files_in_directory("test-data/large-odin-files", pattern = "*.odin")
 
 	all_files := slice.concatenate([][]string{files, large_files})
 	delete(large_files)
@@ -1092,6 +1092,11 @@ test_compress :: proc(t: ^testing.T) {
 	log.infof("Compressed %d files", count)
 }
 
+All_Files_Data :: struct {
+	files:            ^[dynamic]string,
+	filename_pattern: string,
+}
+
 @(private = "file")
 _all_files_walk_proc :: proc(
 	info: os.File_Info,
@@ -1101,9 +1106,21 @@ _all_files_walk_proc :: proc(
 	err: os.Errno,
 	skip_dir: bool,
 ) {
-	if !info.is_dir {
-		files := cast(^[dynamic]string)user_data
-		append(files, info.fullpath)
+	data := cast(^All_Files_Data)user_data
+	is_match, match_error := filepath.match(data.filename_pattern, info.name)
+	if match_error != nil {
+		log.panicf("Could not match filename: %v", match_error)
+	}
+	if !is_match {
+		log.debugf(
+			"Skipping file '%s' because it does not match '%s'",
+			info.fullpath,
+			data.filename_pattern,
+		)
+	}
+	if !info.is_dir && is_match {
+		log.debugf("Adding '%s'", info.fullpath)
+		append(data.files, info.fullpath)
 	}
 
 	return err, skip_dir
@@ -1112,14 +1129,19 @@ _all_files_walk_proc :: proc(
 @(private = "file")
 all_files_in_directory :: proc(
 	path: string,
+	pattern := "",
 	allocator := context.allocator,
+	logger := context.logger,
 ) -> (
 	paths: []string,
 	error: mem.Allocator_Error,
 ) {
+	data: All_Files_Data
+	data.filename_pattern = pattern
 	files := make([dynamic]string, 0, 0, allocator) or_return
+	data.files = &files
 
-	walk_result := filepath.walk(path, _all_files_walk_proc, &files)
+	walk_result := filepath.walk(path, _all_files_walk_proc, &data)
 	if walk_result != os.ERROR_NONE {
 		fmt.panicf("Could not walk directory '%s': %v", path, walk_result)
 	}

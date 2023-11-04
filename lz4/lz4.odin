@@ -6,6 +6,7 @@ import "core:hash/xxhash"
 import "core:io"
 import "core:log"
 import "core:mem"
+import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
@@ -982,7 +983,7 @@ compress_block :: proc(
 		m := match^
 		// NOTE: this should move what is technically the same match further forward in the data
 		// which means we have a better chance of sharing cache space with the data we are already
-		// processing(?)
+		// processing(?). I have not measured this.
 		match.index = i
 		for m.index + m.length < (len(data) - 12) && i + m.length < (len(data) - 12) {
 			if data[i + m.length] != data[m.index + m.length] {
@@ -1080,6 +1081,7 @@ test_compress :: proc(t: ^testing.T) {
 	large_files, _ := all_files_in_directory("test-data/large-odin-files")
 
 	all_files := slice.concatenate([][]string{files, large_files})
+	delete(large_files)
 
 	count := 0
 	for f in all_files {
@@ -1125,12 +1127,16 @@ all_files_in_directory :: proc(
 	return files[:], nil
 }
 
-expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
+expect_compression_invariants_to_hold :: proc(
+	t: ^testing.T,
+	path: string,
+	allocator := context.allocator,
+) {
 	context.logger = log.create_console_logger(ident = path)
 	path := path
 	if filepath.is_abs(path) {
 		cwd := os.get_current_directory()
-		relative_path, relative_path_error := filepath.rel(cwd, path)
+		relative_path, relative_path_error := filepath.rel(cwd, path, allocator)
 		if relative_path_error != nil {
 			fmt.panicf("Could not get relative path: %v", relative_path_error)
 		}
@@ -1138,12 +1144,19 @@ expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
 	}
 	context.logger = log.create_console_logger(ident = path)
 
-	file_data, read_ok := os.read_entire_file_from_filename(path)
+	file_data, read_ok := os.read_entire_file_from_filename(path, allocator)
 	if !read_ok {
 		fmt.panicf("Could not read file for test: '%s'", path)
 	}
 
-	compressed, compress_error := compress(file_data)
+	compression_arena: virtual.Arena
+	arena_init_error := virtual.arena_init_static(&compression_arena, 2 * mem.Megabyte)
+	if arena_init_error != nil {
+		fmt.panicf("Could not initialize compression_arena: %v", arena_init_error)
+	}
+	compression_allocator := virtual.arena_allocator(&compression_arena)
+
+	compressed, compress_error := compress(file_data, allocator = compression_allocator)
 	testing.expect(
 		t,
 		compress_error == nil,
@@ -1160,20 +1173,35 @@ expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
 	)
 	testing.expect(t, len(compressed) > 0, fmt.tprintf("Compressed data is empty\n"))
 
-	frame, _, frame_error := frame_next(compressed)
+	frame_extraction_arena: virtual.Arena
+	arena_init_error = virtual.arena_init_static(&frame_extraction_arena, 2 * mem.Megabyte)
+	if arena_init_error != nil {
+		fmt.panicf("Could not initialize frame_extraction_arena: %v", arena_init_error)
+	}
+	frame_extraction_allocator := virtual.arena_allocator(&frame_extraction_arena)
+	frame, _, frame_error := frame_next(compressed, allocator = frame_extraction_allocator)
 	testing.expect(t, frame_error == nil, fmt.tprintf("Frame error is not nil: %v\n", frame_error))
 	testing.expect(
 		t,
 		frame.descriptor.version == 1,
 		fmt.tprintf("Frame version is not 1: %d\n", frame.descriptor.version),
 	)
+	virtual.arena_destroy(&compression_arena)
 
-	decompressed, decompress_error := decompress_frame(frame)
+	decompression_arena: virtual.Arena
+	arena_init_error = virtual.arena_init_static(&decompression_arena, 8 * mem.Megabyte)
+	if arena_init_error != nil {
+		fmt.panicf("Could not initialize decompression_arena: %v", arena_init_error)
+	}
+	decompression_allocator := virtual.arena_allocator(&decompression_arena)
+	decompressed, decompress_error := decompress_frame(frame, allocator = decompression_allocator)
 	testing.expect(
 		t,
 		decompress_error == nil,
 		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
 	)
+	virtual.arena_destroy(&frame_extraction_arena)
+
 	switch d in decompressed {
 	case []byte:
 		testing.expect(
@@ -1182,7 +1210,7 @@ expect_compression_invariants_to_hold :: proc(t: ^testing.T, path: string) {
 			fmt.tprintf("Decompressed data does not match original data: '%s'\n", d),
 		)
 	case [][]byte:
-		concatenated := bytes.concatenate(d)
+		concatenated := bytes.concatenate(d, allocator)
 		content_checksum := xxhash.XXH32(concatenated, 0)
 		concatenated_length := len(concatenated)
 		testing.expect(

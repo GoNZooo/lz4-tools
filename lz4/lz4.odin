@@ -9,6 +9,7 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:os"
 import "core:path/filepath"
+import "core:runtime"
 import "core:slice"
 import "core:testing"
 
@@ -288,6 +289,7 @@ decompress_frame :: proc(
 	return decompressed_blocks[:], nil
 }
 
+@(private = "file")
 decompress_frame_block :: proc(
 	fb: Frame_Block,
 	max_block_size: int,
@@ -348,31 +350,55 @@ decompress_frame_block :: proc(
 
 @(test, private = "package")
 test_decompress_frame :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
 	Test_Case :: struct {
 		compressed_path: string,
 		plain_text_path: string,
 	}
 
-	paths := []string{
-		"test-data/plain-01.txt",
-		"test-data/lz4-2023-11-01.odin",
-		"test-data/odin/core/os/os_windows.odin",
-		"test-data/odin/core/os/os_darwin.odin",
-		"test-data/odin/core/os/os_linux.odin",
-		"test-data/odin/core/os/os_freebsd.odin",
-		"test-data/odin/core/os/os_openbsd.odin",
+	own_paths := []string{"test-data/plain-01.txt.lz4", "test-data/lz4-2023-11-01.odin.lz4"}
+	odin_files, odin_files_error := all_files_in_directory("test-data/large-odin-files", "*.lz4")
+	if odin_files_error != nil {
+		fmt.panicf("Could not read files in directory: %v\n", odin_files_error)
 	}
+	paths := slice.concatenate([][]string{own_paths, odin_files})
 
 	for path in paths {
 		expect_decompress_frame_invariants_to_hold(t, path)
 	}
 
+	log.infof("Decompressed %d files", len(paths))
+}
+
+@(private = "file")
+_default_determine_logging_proc :: proc(_: string) -> bool {
+	return false
 }
 
 
-expect_decompress_frame_invariants_to_hold :: proc(t: ^testing.T, path: string) {
-	context.logger = log.create_console_logger(ident = fmt.tprintf("%s", path))
-	compressed_path := fmt.tprintf("%s.lz4", path)
+@(private = "file")
+expect_decompress_frame_invariants_to_hold :: proc(
+	t: ^testing.T,
+	compressed_path: string,
+	determine_logging_proc: proc(
+		compressed_path: string,
+	) -> bool = _default_determine_logging_proc,
+) {
+	logger := runtime.default_logger()
+	if filepath.is_abs(compressed_path) {
+		cwd := os.get_current_directory()
+		relative_path, rel_error := filepath.rel(cwd, compressed_path)
+		if rel_error != nil {
+			fmt.panicf("Could not get relative path: %v\n", rel_error)
+		}
+		if determine_logging_proc(relative_path) {
+			logger = log.create_console_logger(ident = fmt.tprintf("%s", relative_path))
+		}
+	}
+	dir := filepath.dir(compressed_path)
+	stem := filepath.stem(compressed_path)
+	path := filepath.join({dir, stem})
+	context.logger = logger
 
 	file_data, read_ok := os.read_entire_file_from_filename(compressed_path)
 	if !read_ok {
@@ -405,7 +431,7 @@ expect_decompress_frame_invariants_to_hold :: proc(t: ^testing.T, path: string) 
 		testing.expect(
 			t,
 			compare_result == 0,
-			fmt.tprintf("Decompressed data does not match plain data\n"),
+			fmt.tprintf("Decompressed data does not match plain data in file '%s'\n", path),
 		)
 	case [][]byte:
 		concatenated := bytes.concatenate(d)
@@ -414,7 +440,7 @@ expect_decompress_frame_invariants_to_hold :: proc(t: ^testing.T, path: string) 
 		testing.expect(
 			t,
 			compare_result == 0,
-			fmt.tprintf("Decompressed data does not match plain data\n"),
+			fmt.tprintf("Decompressed data does not match plain data in file '%s'\n", path),
 		)
 	}
 
@@ -423,7 +449,8 @@ expect_decompress_frame_invariants_to_hold :: proc(t: ^testing.T, path: string) 
 		decompressed_length := len(buffer)
 		if plain_length != decompressed_length {
 			fmt.panicf(
-				"Decompressed data does not match plain data:\n\tLengths do not match: %d != %d\n",
+				"Decompressed data does not match plain data in file '%s':\n\tLengths do not match: %d != %d\n",
+				path,
 				plain_length,
 				decompressed_length,
 			)
@@ -456,7 +483,7 @@ decompress_frame_dependently :: proc(
 	decompressed: []byte,
 	error: Decompress_Frame_Error,
 ) {
-	log.panicf("Block dependence not currently supported")
+	fmt.panicf("Block dependence not currently supported")
 }
 
 @(private = "file")
@@ -1068,20 +1095,12 @@ compress_block :: proc(
 test_compress :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
 
-	files := []string{
-		"test-data/plain-01.txt",
-		"test-data/lz4-2023-11-01.odin",
-		"test-data/odin/core/os/os_windows.odin",
-		"test-data/odin/core/os/os_darwin.odin",
-		"test-data/odin/core/os/os_linux.odin",
-		"test-data/odin/core/os/os_freebsd.odin",
-		"test-data/odin/core/os/os_openbsd.odin",
-	}
+	files := []string{"test-data/plain-01.txt", "test-data/lz4-2023-11-01.odin"}
 
-	large_files, _ := all_files_in_directory("test-data/large-odin-files", pattern = "*.odin")
+	odin_files, _ := all_files_in_directory("test-data/large-odin-files", pattern = "*.odin")
 
-	all_files := slice.concatenate([][]string{files, large_files})
-	delete(large_files)
+	all_files := slice.concatenate([][]string{files, odin_files})
+	delete(odin_files)
 
 	count := 0
 	for f in all_files {
@@ -1131,7 +1150,7 @@ all_files_in_directory :: proc(
 	path: string,
 	pattern := "",
 	allocator := context.allocator,
-	logger := context.logger,
+	logger: ^log.Logger = nil,
 ) -> (
 	paths: []string,
 	error: mem.Allocator_Error,
@@ -1140,6 +1159,7 @@ all_files_in_directory :: proc(
 	data.filename_pattern = pattern
 	files := make([dynamic]string, 0, 0, allocator) or_return
 	data.files = &files
+	context.logger = logger == nil ? runtime.default_logger() : logger^
 
 	walk_result := filepath.walk(path, _all_files_walk_proc, &data)
 	if walk_result != os.ERROR_NONE {
@@ -1153,8 +1173,8 @@ expect_compression_invariants_to_hold :: proc(
 	t: ^testing.T,
 	path: string,
 	allocator := context.allocator,
+	logger: ^log.Logger = nil,
 ) {
-	context.logger = log.create_console_logger(ident = path)
 	path := path
 	if filepath.is_abs(path) {
 		cwd := os.get_current_directory()
@@ -1164,7 +1184,7 @@ expect_compression_invariants_to_hold :: proc(
 		}
 		path = relative_path
 	}
-	context.logger = log.create_console_logger(ident = path)
+	context.logger = logger == nil ? runtime.default_logger() : logger^
 
 	file_data, read_ok := os.read_entire_file_from_filename(path, allocator)
 	if !read_ok {

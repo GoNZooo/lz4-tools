@@ -1710,7 +1710,6 @@ expect_compression_invariants_to_hold :: proc(
 	decompression_allocator := virtual.arena_allocator(&decompression_arena)
 	decompressed, rest, decompress_error := decompress(
 		compressed,
-		content_size = len(file_data),
 		allocator = decompression_allocator,
 	)
 	testing.expect(t, len(rest) == 0, fmt.tprintf("Rest is not empty: %#x\n", rest)) or_return

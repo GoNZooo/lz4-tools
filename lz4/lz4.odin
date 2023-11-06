@@ -172,10 +172,29 @@ read_frame_blocks :: proc(
 		if size == 0 {
 			break
 		}
+		log.debugf(
+			"read: compressed=%v\thas_checksum=%v\tsize=%d\tsize_bytes=%x\n",
+			compressed,
+			has_checksum,
+			size,
+			block_size_buffer,
+		)
 
 		data := make([]byte, size, allocator) or_return
 		n = bytes.reader_read(r, data) or_return
-		assert(n == int(size))
+		assert(
+			u32(n) == size,
+			fmt.tprintf(
+				"block data bytes read != size: %d != %d (compressed=%v\thas_checksum=%v\tsize=%d\tblock_size=%d\tsize_bytes=%x)",
+				n,
+				size,
+				compressed,
+				has_checksum,
+				size,
+				block_size,
+				block_size_buffer,
+			),
+		)
 
 		checksum: u32le
 		if has_checksum {
@@ -200,6 +219,7 @@ read_frame_blocks :: proc(
 		if possible_end_marker == 0 {
 			break
 		}
+		r.i -= 4
 	}
 
 	return frame_blocks[:], nil
@@ -591,9 +611,9 @@ frame_serialize :: proc(
 	}
 
 	bytes_so_far := bytes.buffer_to_bytes(&b)
+	// we skip the magic number for the checksum calculation
 	header_bytes := bytes_so_far[4:]
 	hash := xxhash.XXH32(header_bytes, 0)
-	// we skip the magic number for the checksum calculation
 	header_checksum := u8(hash >> 8)
 	assert(
 		header_checksum == f.descriptor.header_checksum,
@@ -625,19 +645,43 @@ write_frame_blocks :: proc(
 	has_checksum: bool,
 	blocks: []Frame_Block,
 ) -> io.Error {
-	for block in blocks {
+	for block, i in blocks {
 		block_size := block.size
 		if !block.compressed {
 			block_size |= 0x8000_0000
 		}
 		block_size_bytes := transmute([4]byte)u32le(block_size)
-		bytes.buffer_write(b, block_size_bytes[:]) or_return
+		log.debugf(
+			"Writing block #%d: has_block_checksum=%v\tblock_size=%d\t block_size_bytes=%x\n",
+			i,
+			has_checksum,
+			block_size,
+			block_size_bytes,
+		)
+		size_bytes_written := bytes.buffer_write(b, block_size_bytes[:]) or_return
+		assert(
+			size_bytes_written == 4,
+			fmt.tprintf("size_bytes_written != 4: %d", size_bytes_written),
+		)
 
-		bytes.buffer_write(b, block.data) or_return
+		data_bytes_written := bytes.buffer_write(b, block.data) or_return
+		assert(
+			data_bytes_written == block.size,
+			fmt.tprintf(
+				"data_bytes_written != block.size: %d != %d (len(block.data)=%d)",
+				data_bytes_written,
+				block.size,
+				len(block.data),
+			),
+		)
 
 		if has_checksum {
 			block_checksum_bytes := transmute([4]byte)u32(block.checksum)
-			bytes.buffer_write(b, block_checksum_bytes[:]) or_return
+			checksum_bytes_written := bytes.buffer_write(b, block_checksum_bytes[:]) or_return
+			assert(
+				checksum_bytes_written == 4,
+				fmt.tprintf("checksum_bytes_written != 4: %d", checksum_bytes_written),
+			)
 		}
 	}
 
@@ -646,7 +690,7 @@ write_frame_blocks :: proc(
 
 @(test, private = "package")
 test_frame_serialize :: proc(t: ^testing.T) {
-	context.logger = log.create_console_logger()
+	context.logger = log.create_console_logger(lowest = .Info)
 
 	path :: "test-data/plain-01.txt.lz4"
 	file_data, read_ok := os.read_entire_file_from_filename(path)
@@ -825,7 +869,7 @@ frame_header_serialize :: proc(
 // Produces a serialized LZ4 frame from the given data.
 compress :: proc(
 	data: []byte,
-	max_block_size: Max_Block_Size = Max_Block_Size.Megabytes_4,
+	max_block_size: Max_Block_Size = Max_Block_Size.Kilobytes_64,
 	allocator := context.allocator,
 ) -> (
 	result: []byte,
@@ -854,6 +898,7 @@ compress :: proc(
 	if len(data) % max_block_size_int != 0 {
 		number_of_blocks += 1
 	}
+	log.debugf("Number of blocks: %d\n", number_of_blocks)
 
 	blocks := make([dynamic]Frame_Block, 0, number_of_blocks, allocator) or_return
 
@@ -1054,13 +1099,35 @@ test_compress :: proc(t: ^testing.T) {
 	all_files := slice.concatenate([][]string{files, odin_files})
 	delete(odin_files)
 
-	count := 0
+	count_4mb := 0
 	for f in all_files {
-		expect_compression_invariants_to_hold(t, f)
-		count += 1
+		logger := runtime.default_logger()
+		expect_compression_invariants_to_hold(
+			t,
+			f,
+			max_block_size = .Megabytes_4,
+			logger = &logger,
+		)
+		count_4mb += 1
 	}
 
-	log.infof("Compressed %d files", count)
+
+	log.infof("Compressed %d files with max block size 4MB", count_4mb)
+
+	count_64kb := 0
+	for f in all_files {
+		logger := runtime.default_logger()
+		expect_compression_invariants_to_hold(
+			t,
+			f,
+			max_block_size = .Kilobytes_64,
+			logger = &logger,
+		)
+		count_64kb += 1
+	}
+
+
+	log.infof("Compressed %d files with max block size 64kB", count_64kb)
 }
 
 All_Files_Data :: struct {
@@ -1124,6 +1191,7 @@ all_files_in_directory :: proc(
 expect_compression_invariants_to_hold :: proc(
 	t: ^testing.T,
 	path: string,
+	max_block_size: Max_Block_Size,
 	allocator := context.allocator,
 	logger: ^log.Logger = nil,
 ) {
@@ -1144,13 +1212,17 @@ expect_compression_invariants_to_hold :: proc(
 	}
 
 	compression_arena: virtual.Arena
-	arena_init_error := virtual.arena_init_static(&compression_arena, 2 * mem.Megabyte)
+	arena_init_error := virtual.arena_init_static(&compression_arena, 4 * mem.Megabyte)
 	if arena_init_error != nil {
 		fmt.panicf("Could not initialize compression_arena: %v", arena_init_error)
 	}
 	compression_allocator := virtual.arena_allocator(&compression_arena)
 
-	compressed, compress_error := compress(file_data, allocator = compression_allocator)
+	compressed, compress_error := compress(
+		file_data,
+		max_block_size = max_block_size,
+		allocator = compression_allocator,
+	)
 	testing.expect(
 		t,
 		compress_error == nil,

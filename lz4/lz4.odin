@@ -212,14 +212,14 @@ Data_Block :: struct {
 	match_length: int,
 }
 
-Decompress_Frame_Error :: union {
+Frame_Decompress_Error :: union {
 	Insufficient_Space_In_Buffer,
-	Decompress_Frame_Block_Error,
+	Frame_Block_Decompress_Error,
 	io.Error,
 	mem.Allocator_Error,
 }
 
-Decompress_Frame_Block_Error :: struct {
+Frame_Block_Decompress_Error :: struct {
 	block:            Frame_Block,
 	data_block_index: int,
 	error:            Data_Block_Error,
@@ -229,7 +229,6 @@ Data_Block_Error :: union {
 	Zero_Offset,
 	Not_Enough_Literals,
 	io.Error,
-	mem.Allocator_Error,
 }
 
 Zero_Offset :: struct {
@@ -246,22 +245,22 @@ Insufficient_Space_In_Buffer :: struct {
 	actual:   int,
 }
 
-Decompress_Frame_Result :: union {
+Frame_Decompress_Result :: union {
 	[][]byte,
 	[]byte,
 }
 
-decompress_frame :: proc(
+frame_decompress :: proc(
 	frame: Frame,
 	allocator := context.allocator,
 ) -> (
-	decompressed: Decompress_Frame_Result,
-	error: Decompress_Frame_Error,
+	decompressed: Frame_Decompress_Result,
+	error: Frame_Decompress_Error,
 ) {
 	// NOTE(gonz): if we have block dependence but only one block in the frame it should be the same
 	// as having independent blocks, I assume
 	if !frame.descriptor.block_independence && len(frame.blocks) > 1 {
-		return decompress_frame_dependently(frame, allocator)
+		return frame_decompress_dependently(frame, allocator)
 	}
 
 	decompressed_blocks := make([dynamic][]byte, 0, len(frame.blocks), allocator) or_return
@@ -278,7 +277,7 @@ decompress_frame :: proc(
 			continue
 		}
 
-		decompressed_block := decompress_frame_block(
+		decompressed_block := frame_block_decompress(
 			b,
 			frame.descriptor.block_max_size,
 			allocator,
@@ -290,34 +289,35 @@ decompress_frame :: proc(
 }
 
 @(private = "file")
-decompress_frame_block :: proc(
+frame_block_decompress :: proc(
 	fb: Frame_Block,
 	max_block_size: int,
 	allocator := context.allocator,
 ) -> (
 	decompressed: []byte,
-	error: Decompress_Frame_Error,
+	error: Frame_Decompress_Error,
 ) {
 	b: bytes.Buffer
 	bytes.buffer_init_allocator(&b, 0, max_block_size, allocator)
-	r: bytes.Reader
-	bytes.reader_init(&r, fb.data)
 
-	for {
-		db, data_block_read_error := read_data_block(&r, allocator)
-		if data_block_read_error == .EOF {
-			break
-		} else if data_block_read_error != nil {
+	block_data := fb.data
+	for len(block_data) > 0 {
+		db, rest, data_block_read_error := data_block_read(block_data, allocator)
+		if data_block_read_error != nil {
 			return nil,
-				Decompress_Frame_Block_Error{
+				Frame_Block_Decompress_Error{
 					block = fb,
 					data_block_index = len(decompressed),
 					error = data_block_read_error,
 				}
 		}
+		block_data = rest
 
-		n := bytes.buffer_write(&b, db.literals) or_return
-		assert(n == db.length)
+		literals_written := bytes.buffer_write(&b, db.literals) or_return
+		assert(
+			literals_written == db.length,
+			fmt.tprintf("literals_written != db.length: %d != %d", literals_written, db.length),
+		)
 
 		if db.offset == 0 {
 			continue
@@ -334,7 +334,10 @@ decompress_frame_block :: proc(
 			}
 		} else {
 			match_start := len(b.buf) - db.offset
-			assert(match_start >= 0 && match_start <= len(b.buf), "match_start is out of bounds")
+			assert(
+				match_start >= 0 && match_start <= len(b.buf),
+				fmt.tprintf("match_start is out of bounds: %d", match_start),
+			)
 			match_end := match_start + db.match_length
 			assert(match_end >= 0 && match_end <= len(b.buf), "match_end is out of bounds")
 			match_bytes := b.buf[match_start:match_end]
@@ -349,7 +352,7 @@ decompress_frame_block :: proc(
 }
 
 @(test, private = "package")
-test_decompress_frame :: proc(t: ^testing.T) {
+test_frame_decompress :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
 	Test_Case :: struct {
 		compressed_path: string,
@@ -415,7 +418,7 @@ expect_decompress_frame_invariants_to_hold :: proc(
 		panic("Could not read frame")
 	}
 	assert(len(frame.blocks) == 1)
-	decompressed, decompress_error := decompress_frame(frame)
+	decompressed, decompress_error := frame_decompress(frame)
 	testing.expect(
 		t,
 		decompress_error == nil,
@@ -476,55 +479,55 @@ expect_decompress_frame_invariants_to_hold :: proc(
 	}
 }
 
-decompress_frame_dependently :: proc(
+@(private = "file")
+frame_decompress_dependently :: proc(
 	frame: Frame,
 	allocator := context.allocator,
 ) -> (
 	decompressed: []byte,
-	error: Decompress_Frame_Error,
+	error: Frame_Decompress_Error,
 ) {
 	fmt.panicf("Block dependence not currently supported")
 }
 
-@(private = "file")
-read_data_block :: proc(
-	r: ^bytes.Reader,
+data_block_read :: proc(
+	data: []byte,
 	allocator := context.allocator,
 ) -> (
 	block: Data_Block,
+	rest: []byte,
 	error: Data_Block_Error,
 ) {
-	token_byte := bytes.reader_read_byte(r) or_return
+	i := 0
+	token_byte := data[i]
+	i += 1
 	initial_read := token_byte >> 4
 	block.length = int(initial_read)
 	last_read_length: byte = 255
 	for initial_read == 15 && last_read_length == 255 {
-		b := bytes.reader_read_byte(r) or_return
+		b := data[i]
+		i += 1
 		last_read_length = b
 		block.length += int(last_read_length)
 	}
 
-	if block.length == 0 {
-		block.literals = []byte{}
-	} else {
-		literals := make([]byte, block.length, allocator) or_return
+	literals := data[i:i + block.length]
 
-		literal_bytes_read := bytes.reader_read(r, literals) or_return
-		assert(literal_bytes_read == block.length)
+	assert(len(literals) == block.length)
 
-		block.literals = literals
-	}
+	block.literals = literals
 
-	offset_buffer: [2]byte
-	offset_bytes_read, offset_read := bytes.reader_read(r, offset_buffer[:])
-	if offset_read == .EOF {
+	i += block.length
+
+	if i == len(data) {
 		// This means we've read the last block, we have only literals and no offset
-		return block, nil
+		return block, data[i:], nil
 	}
-	assert(offset_bytes_read == 2)
-	offset := transmute(u16le)offset_buffer
+	offset_bytes := [2]byte{data[i], data[i + 1]}
+	i += 2
+	offset := transmute(u16le)offset_bytes
 	if offset == 0 {
-		return Data_Block{}, Zero_Offset{position = int(r.i)}
+		return Data_Block{}, data[i:], Zero_Offset{position = i}
 	}
 	block.offset = int(offset)
 
@@ -532,65 +535,14 @@ read_data_block :: proc(
 	block.match_length = int(initial_read)
 	last_read_length = 255
 	for initial_read == 15 && last_read_length == 255 {
-		b := bytes.reader_read_byte(r) or_return
+		b := data[i]
+		i += 1
 		last_read_length = b
 		block.match_length += int(last_read_length)
 	}
 	block.match_length += 4
 
-	return block, nil
-}
-
-@(test, private = "package")
-test_read_data_block :: proc(t: ^testing.T) {
-	context.logger = log.create_console_logger()
-
-	bytes_1_prelude := []byte{0x88}
-	offset_bytes_1 := transmute([2]byte)u16le(4)
-	bytes_1 := bytes.concatenate(
-		[][]byte{bytes_1_prelude, bytes.repeat([]byte{0}, 8), offset_bytes_1[:]},
-	)
-	r1: bytes.Reader
-	bytes.reader_init(&r1, bytes_1)
-	block1, err1 := read_data_block(&r1)
-	testing.expect_value(t, err1, nil)
-	testing.expect_value(t, block1.length, 8)
-	testing.expect_value(t, block1.match_length, 12)
-	testing.expect_value(t, block1.offset, 4)
-
-	bytes_2_prelude := []byte{0xf4, 0xff, 2}
-	offset_bytes_2 := transmute([2]byte)u16le(1)
-	bytes_2 := bytes.concatenate(
-		[][]byte{bytes_2_prelude, bytes.repeat([]byte{0}, 15 + 255 + 2), offset_bytes_2[:]},
-	)
-	r2: bytes.Reader
-	bytes.reader_init(&r2, bytes_2)
-	block2, err2 := read_data_block(&r2)
-	testing.expect_value(t, err2, nil)
-	testing.expect_value(t, block2.length, 15 + 255 + 2)
-	testing.expect_value(t, block2.match_length, 8)
-	testing.expect_value(t, block2.offset, 1)
-
-	bytes_3 := []byte{0xf0, 33}
-	r3: bytes.Reader
-	bytes.reader_init(&r3, bytes_3)
-	block3, err3 := read_data_block(&r3)
-	testing.expect_value(t, err3, io.Error.EOF)
-	testing.expect_value(t, block3.length, 48)
-
-	bytes_4 := []byte{0xf0, 255, 10}
-	r4: bytes.Reader
-	bytes.reader_init(&r4, bytes_4)
-	block4, err4 := read_data_block(&r4)
-	testing.expect_value(t, err4, io.Error.EOF)
-	testing.expect_value(t, block4.length, 280)
-
-	bytes_5 := []byte{0xf0, 0}
-	r5: bytes.Reader
-	bytes.reader_init(&r5, bytes_5)
-	block5, err5 := read_data_block(&r5)
-	testing.expect_value(t, err5, io.Error.EOF)
-	testing.expect_value(t, block5.length, 15)
+	return block, data[i:], nil
 }
 
 frame_serialize :: proc(
@@ -1236,7 +1188,7 @@ expect_compression_invariants_to_hold :: proc(
 		fmt.panicf("Could not initialize decompression_arena: %v", arena_init_error)
 	}
 	decompression_allocator := virtual.arena_allocator(&decompression_arena)
-	decompressed, decompress_error := decompress_frame(frame, allocator = decompression_allocator)
+	decompressed, decompress_error := frame_decompress(frame, allocator = decompression_allocator)
 	testing.expect(
 		t,
 		decompress_error == nil,

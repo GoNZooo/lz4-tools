@@ -11,7 +11,9 @@ import "core:os"
 import "core:path/filepath"
 import "core:runtime"
 import "core:slice"
+import "core:strings"
 import "core:testing"
+import "core:time"
 
 MAGIC_VALUE :: 0x184D2204
 
@@ -1088,6 +1090,25 @@ compress_block :: proc(
 	return result, nil
 }
 
+@(private = "file")
+make_all_directories :: proc(path: string) {
+	dir := filepath.dir(path)
+	directories, split_error := strings.split(dir, "/")
+	if split_error != nil {
+		fmt.panicf("Could not split path '%s': %v", dir, split_error)
+	}
+	for _, i in directories {
+		parts := directories[:i + 1]
+		directory := filepath.join(parts)
+		make_dir_error := os.make_directory(directory)
+		if make_dir_error == os.EEXIST {
+			continue
+		} else if make_dir_error != os.ERROR_NONE {
+			fmt.panicf("Could not make directory '%s': %v", directory, make_dir_error)
+		}
+	}
+}
+
 @(test, private = "package")
 test_compress :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
@@ -1099,35 +1120,46 @@ test_compress :: proc(t: ^testing.T) {
 	all_files := slice.concatenate([][]string{files, odin_files})
 	delete(odin_files)
 
-	count_4mb := 0
-	for f in all_files {
-		logger := runtime.default_logger()
-		expect_compression_invariants_to_hold(
-			t,
-			f,
-			max_block_size = .Megabytes_4,
-			logger = &logger,
-		)
-		count_4mb += 1
+	sizes := []Max_Block_Size{.Kilobytes_64, .Kilobytes_256, .Megabyte, .Megabytes_4}
+	cwd := os.get_current_directory()
+
+	for size in sizes {
+		count := 0
+		start := time.tick_now()
+		for f in all_files {
+			log_filename := f
+			if filepath.is_abs(f) {
+				relative_filename, relative_filename_error := filepath.rel(cwd, f)
+				if relative_filename_error != nil {
+					fmt.panicf("Could not get relative filename: %v", relative_filename_error)
+				}
+				log_filename = relative_filename
+			}
+			path := filepath.join([]string{"test-logs", "compress", log_filename})
+			make_all_directories(path)
+			h, open_error := os.open(path, flags = os.O_WRONLY | os.O_CREATE, mode = 0o644)
+			if open_error != os.ERROR_NONE {
+				fmt.panicf("Could not open test log file '%s': %v", path, os.Errno(open_error))
+			}
+			logger := log.create_file_logger(h, lowest = .Debug)
+			ok := expect_compression_invariants_to_hold(
+				t,
+				f,
+				max_block_size = size,
+				logger = &logger,
+			)
+			if ok {
+				os.remove(path)
+			} else {
+				fmt.panicf("Compression test failed for '%s', log file is at '%s'", f, path)
+			}
+			count += 1
+		}
+		diff := time.tick_diff(start, time.tick_now())
+		diff_float := f64(diff) / f64(time.Second)
+
+		log.infof("Compressed %d files with max block size %v in %.6fs", count, size, diff_float)
 	}
-
-
-	log.infof("Compressed %d files with max block size 4MB", count_4mb)
-
-	count_64kb := 0
-	for f in all_files {
-		logger := runtime.default_logger()
-		expect_compression_invariants_to_hold(
-			t,
-			f,
-			max_block_size = .Kilobytes_64,
-			logger = &logger,
-		)
-		count_64kb += 1
-	}
-
-
-	log.infof("Compressed %d files with max block size 64kB", count_64kb)
 }
 
 All_Files_Data :: struct {
@@ -1194,6 +1226,8 @@ expect_compression_invariants_to_hold :: proc(
 	max_block_size: Max_Block_Size,
 	allocator := context.allocator,
 	logger: ^log.Logger = nil,
+) -> (
+	ok: bool,
 ) {
 	path := path
 	if filepath.is_abs(path) {
@@ -1227,7 +1261,7 @@ expect_compression_invariants_to_hold :: proc(
 		t,
 		compress_error == nil,
 		fmt.tprintf("Compress error is not nil: %v\n", compress_error),
-	)
+	) or_return
 	testing.expect(
 		t,
 		len(compressed) < len(file_data),
@@ -1236,8 +1270,8 @@ expect_compression_invariants_to_hold :: proc(
 			len(compressed),
 			len(file_data),
 		),
-	)
-	testing.expect(t, len(compressed) > 0, fmt.tprintf("Compressed data is empty\n"))
+	) or_return
+	testing.expect(t, len(compressed) > 0, fmt.tprintf("Compressed data is empty\n")) or_return
 
 	frame_extraction_arena: virtual.Arena
 	arena_init_error = virtual.arena_init_static(&frame_extraction_arena, 2 * mem.Megabyte)
@@ -1246,12 +1280,16 @@ expect_compression_invariants_to_hold :: proc(
 	}
 	frame_extraction_allocator := virtual.arena_allocator(&frame_extraction_arena)
 	frame, _, frame_error := frame_next(compressed, allocator = frame_extraction_allocator)
-	testing.expect(t, frame_error == nil, fmt.tprintf("Frame error is not nil: %v\n", frame_error))
+	testing.expect(
+		t,
+		frame_error == nil,
+		fmt.tprintf("Frame error is not nil: %v\n", frame_error),
+	) or_return
 	testing.expect(
 		t,
 		frame.descriptor.version == 1,
 		fmt.tprintf("Frame version is not 1: %d\n", frame.descriptor.version),
-	)
+	) or_return
 	virtual.arena_destroy(&compression_arena)
 
 	decompression_arena: virtual.Arena
@@ -1265,7 +1303,7 @@ expect_compression_invariants_to_hold :: proc(
 		t,
 		decompress_error == nil,
 		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
-	)
+	) or_return
 	virtual.arena_destroy(&frame_extraction_arena)
 
 	switch d in decompressed {
@@ -1274,7 +1312,7 @@ expect_compression_invariants_to_hold :: proc(
 			t,
 			bytes.compare(d, file_data) == 0,
 			fmt.tprintf("Decompressed data does not match original data: '%s'\n", d),
-		)
+		) or_return
 	case [][]byte:
 		concatenated := bytes.concatenate(d, allocator)
 		content_checksum := xxhash.XXH32(concatenated, 0)
@@ -1287,7 +1325,7 @@ expect_compression_invariants_to_hold :: proc(
 				concatenated_length,
 				frame.descriptor.content_size,
 			),
-		)
+		) or_return
 
 		if concatenated_length != frame.descriptor.content_size {
 			concatenated_end: [25]byte
@@ -1308,7 +1346,7 @@ expect_compression_invariants_to_hold :: proc(
 					content_checksum,
 					frame.content_checksum,
 				),
-			)
+			) or_return
 			compare_result := bytes.compare(concatenated, file_data)
 			testing.expect(
 				t,
@@ -1317,9 +1355,11 @@ expect_compression_invariants_to_hold :: proc(
 					"Decompressed data does not match original data: '%s'\n",
 					concatenated,
 				),
-			)
+			) or_return
 		}
 	}
+
+	return true
 }
 
 get_block_max_size :: proc(byte: byte) -> int {

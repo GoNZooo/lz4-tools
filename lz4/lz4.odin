@@ -259,13 +259,6 @@ read_frame_blocks :: proc(
 		if size == 0 {
 			break
 		}
-		log.debugf(
-			"read: compressed=%v\thas_checksum=%v\tsize=%d\tsize_bytes=%x\n",
-			compressed,
-			has_checksum,
-			size,
-			block_size_buffer,
-		)
 
 		data := make([]byte, size, allocator) or_return
 		n = bytes.reader_read(r, data) or_return
@@ -384,10 +377,6 @@ decompress :: proc(
 	error: Decompress_Error,
 ) {
 	data := input_data
-	defer {
-		log.debugf("len(decompressed) = %d", len(decompressed))
-		log.debugf("%s", decompressed)
-	}
 
 	descriptor, after_descriptor := frame_descriptor_read(data) or_return
 	decompressed = make(
@@ -397,7 +386,6 @@ decompress :: proc(
 	) or_return
 
 	data = after_descriptor
-	log.debugf("len(after_descriptor) = %d", len(after_descriptor))
 
 	copy_index := 0
 	for {
@@ -437,7 +425,6 @@ decompress :: proc(
 			}
 
 			literals := fb.data[i:i + literals_length]
-			log.debugf("literals = %s", literals)
 			i += literals_length
 
 			if len(literals) != literals_length {
@@ -483,15 +470,6 @@ decompress :: proc(
 
 			if int(offset) < match_length {
 				copy_bytes := decompressed[copy_start:copy_index]
-				log.debugf(
-					"copy_start=%d, copy_end=%d, copy_index=%d, offset=%d, match_length=%d, copy_bytes='%s'",
-					copy_start,
-					copy_end,
-					copy_index,
-					offset,
-					match_length,
-					copy_bytes,
-				)
 				copy(decompressed[copy_index:], copy_bytes)
 				copy_index += len(copy_bytes)
 				remaining_bytes := match_length - int(offset)
@@ -501,7 +479,6 @@ decompress :: proc(
 				copy_index += remaining_bytes
 			} else {
 				copy_bytes := decompressed[copy_start:copy_end]
-				log.debugf("copy_bytes = %s", copy_bytes)
 				copy(decompressed[copy_index:], copy_bytes)
 				copy_index += match_length
 			}
@@ -528,11 +505,6 @@ decompress :: proc(
 		copy(content_checksum_buffer[:], data[:4])
 		content_checksum := transmute(u32le)content_checksum_buffer
 		calculated_content_checksum := u32le(xxhash.XXH32(decompressed, 0))
-		log.debugf(
-			"content_checksum_buffer=%#x, calculated=%#02x",
-			content_checksum_buffer,
-			calculated_content_checksum,
-		)
 
 		if content_checksum != calculated_content_checksum {
 			return decompressed,
@@ -579,13 +551,6 @@ frame_block_read :: proc(
 	if block_size == 0 {
 		return Frame_Block{}, data[i:], End_Mark_Found{rest = data[i:]}
 	}
-	log.debugf(
-		"read: compressed=%v\thas_checksum=%v\tsize=%d\tsize_bytes=%x\n",
-		compressed,
-		has_checksum,
-		size,
-		block_size_buffer,
-	)
 
 	if len(data) < i + size {
 		return Frame_Block{}, nil, Data_Too_Small{size = len(data)}
@@ -713,28 +678,6 @@ frame_block_decompress :: proc(
 }
 
 @(test, private = "package")
-test_frame_decompress :: proc(t: ^testing.T) {
-	context.logger = log.create_console_logger()
-	Test_Case :: struct {
-		compressed_path: string,
-		plain_text_path: string,
-	}
-
-	own_paths := []string{"test-data/plain-01.txt.lz4", "test-data/lz4-2023-11-01.odin.lz4"}
-	odin_files, odin_files_error := all_files_in_directory("test-data/large-odin-files", "*.lz4")
-	if odin_files_error != nil {
-		fmt.panicf("Could not read files in directory: %v\n", odin_files_error)
-	}
-	paths := slice.concatenate([][]string{own_paths, odin_files})
-
-	for path in paths {
-		expect_decompress_frame_invariants_to_hold(t, path)
-	}
-
-	log.infof("Decompressed %d files", len(paths))
-}
-
-@(test, private = "package")
 test_decompress :: proc(t: ^testing.T) {
 	context.logger = log.create_console_logger()
 	Test_Case :: struct {
@@ -750,41 +693,94 @@ test_decompress :: proc(t: ^testing.T) {
 	paths := slice.concatenate([][]string{own_paths, odin_files})
 	cwd := os.get_current_directory()
 
+	start_time := time.tick_now()
 	for path in paths {
-		log_filename := path
-		if filepath.is_abs(path) {
-			relative_filename, relative_filename_error := filepath.rel(cwd, path)
-			if relative_filename_error != nil {
-				fmt.panicf("Could not get relative filename: %v", relative_filename_error)
+		ok := expect_decompress_invariants_to_hold(t, path, logger = log.nil_logger())
+		if !ok {
+			log_filename := path
+			if filepath.is_abs(path) {
+				relative_filename, relative_filename_error := filepath.rel(cwd, path)
+				if relative_filename_error != nil {
+					fmt.panicf("Could not get relative filename: %v", relative_filename_error)
+				}
+				log_filename = relative_filename
 			}
-			log_filename = relative_filename
-		}
-		log_path := filepath.join([]string{"test-logs", "decompress", log_filename})
-		make_all_directories(log_path)
-		h, open_error := os.open(
-			log_path,
-			flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC,
-			mode = 0o644,
-		)
-		defer os.close(h)
-		if open_error != os.ERROR_NONE {
-			fmt.panicf("Could not open test log file '%s': %v", log_path, os.Errno(open_error))
-		}
-		ok := expect_decompress_invariants_to_hold(
-			t,
-			path,
-			logger = log.create_file_logger(h, lowest = .Debug),
-		)
-		if ok {
-			os.remove(log_path)
-		} else {
+			log_path := filepath.join([]string{"test-logs", "decompress", log_filename})
+			make_all_directories(log_path)
+			h, open_error := os.open(
+				log_path,
+				flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC,
+				mode = 0o644,
+			)
+			if open_error != os.ERROR_NONE {
+				fmt.panicf("Could not open test log file '%s': %v", log_path, os.Errno(open_error))
+			}
+			expect_decompress_invariants_to_hold(
+				t,
+				path,
+				logger = log.create_file_logger(h, lowest = .Debug),
+			)
+			os.close(h)
+
 			fmt.panicf("Decompression test failed for '%s', log file is at '%s'", path, log_path)
 		}
 	}
 
-	log.infof("Decompressed %d files", len(paths))
+	diff := time.tick_diff(start_time, time.tick_now())
+	log.infof("Decompressed %d files in %d", len(paths), diff)
 }
 
+@(test, private = "package")
+test_frame_decompress :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
+	Test_Case :: struct {
+		compressed_path: string,
+		plain_text_path: string,
+	}
+
+	own_paths := []string{"test-data/plain-01.txt.lz4", "test-data/lz4-2023-11-01.odin.lz4"}
+	odin_files, odin_files_error := all_files_in_directory("test-data/large-odin-files", "*.lz4")
+	if odin_files_error != nil {
+		fmt.panicf("Could not read files in directory: %v\n", odin_files_error)
+	}
+	paths := slice.concatenate([][]string{own_paths, odin_files})
+	cwd := os.get_current_directory()
+
+	start_time := time.tick_now()
+	for path in paths {
+		ok := expect_decompress_frame_invariants_to_hold(t, path, logger = log.nil_logger())
+		if !ok {
+			log_filename := path
+			if filepath.is_abs(path) {
+				relative_filename, relative_filename_error := filepath.rel(cwd, path)
+				if relative_filename_error != nil {
+					fmt.panicf("Could not get relative filename: %v", relative_filename_error)
+				}
+				log_filename = relative_filename
+			}
+			log_path := filepath.join([]string{"test-logs", "decompress", log_filename})
+			make_all_directories(log_path)
+			h, open_error := os.open(
+				log_path,
+				flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC,
+				mode = 0o644,
+			)
+			if open_error != os.ERROR_NONE {
+				fmt.panicf("Could not open test log file '%s': %v", log_path, os.Errno(open_error))
+			}
+			expect_decompress_frame_invariants_to_hold(
+				t,
+				path,
+				logger = log.create_file_logger(h, lowest = .Debug),
+			)
+			os.close(h)
+			fmt.panicf("Decompression test failed for '%s', log file is at '%s'", path, log_path)
+		}
+	}
+
+	diff := time.tick_diff(start_time, time.tick_now())
+	log.infof("Decompressed %d files in %d", len(paths), diff)
+}
 
 @(private = "file")
 _default_determine_logging_proc :: proc(_: string) -> bool {
@@ -796,25 +792,13 @@ _default_determine_logging_proc :: proc(_: string) -> bool {
 expect_decompress_frame_invariants_to_hold :: proc(
 	t: ^testing.T,
 	compressed_path: string,
-	determine_logging_proc: proc(
-		compressed_path: string,
-	) -> bool = _default_determine_logging_proc,
-) {
-	logger := runtime.default_logger()
-	if filepath.is_abs(compressed_path) {
-		cwd := os.get_current_directory()
-		relative_path, rel_error := filepath.rel(cwd, compressed_path)
-		if rel_error != nil {
-			fmt.panicf("Could not get relative path: %v\n", rel_error)
-		}
-		if determine_logging_proc(relative_path) {
-			logger = log.create_console_logger(ident = fmt.tprintf("%s", relative_path))
-		}
-	}
+	logger: log.Logger,
+) -> bool {
+	context.logger = logger
+
 	dir := filepath.dir(compressed_path)
 	stem := filepath.stem(compressed_path)
 	path := filepath.join({dir, stem})
-	context.logger = logger
 
 	file_data, read_ok := os.read_entire_file_from_filename(compressed_path)
 	if !read_ok {
@@ -836,7 +820,7 @@ expect_decompress_frame_invariants_to_hold :: proc(
 		t,
 		decompress_error == nil,
 		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
-	)
+	) or_return
 
 	compare_result: int
 	buffer: []byte
@@ -848,7 +832,7 @@ expect_decompress_frame_invariants_to_hold :: proc(
 			t,
 			compare_result == 0,
 			fmt.tprintf("Decompressed data does not match plain data in file '%s'\n", path),
-		)
+		) or_return
 	case [][]byte:
 		concatenated := bytes.concatenate(d)
 		buffer = concatenated
@@ -857,7 +841,7 @@ expect_decompress_frame_invariants_to_hold :: proc(
 			t,
 			compare_result == 0,
 			fmt.tprintf("Decompressed data does not match plain data in file '%s'\n", path),
-		)
+		) or_return
 	}
 
 	if compare_result != 0 {
@@ -890,6 +874,8 @@ expect_decompress_frame_invariants_to_hold :: proc(
 			}
 		}
 	}
+
+	return true
 }
 
 @(private = "file")
@@ -907,13 +893,11 @@ expect_decompress_invariants_to_hold :: proc(
 	if !read_ok {
 		fmt.panicf("Could not read file for test: '%s'", compressed_path)
 	}
-	log.debugf("len(compressed) = %d", len(file_data))
 
 	plain_data, plain_read_ok := os.read_entire_file_from_filename(path)
 	if !plain_read_ok {
 		fmt.panicf("Could not read file for test: '%s'", path)
 	}
-	log.debugf("len(plain) = %d", len(plain_data))
 
 	decompressed, rest, decompress_error := decompress(file_data, content_size = len(plain_data))
 	testing.expect(
@@ -1112,19 +1096,12 @@ write_frame_blocks :: proc(
 	has_checksum: bool,
 	blocks: []Frame_Block,
 ) -> io.Error {
-	for block, i in blocks {
+	for block in blocks {
 		block_size := block.size
 		if !block.compressed {
 			block_size |= 0x8000_0000
 		}
 		block_size_bytes := transmute([4]byte)u32le(block_size)
-		log.debugf(
-			"Writing block #%d: has_block_checksum=%v\tblock_size=%d\t block_size_bytes=%x\n",
-			i,
-			has_checksum,
-			block_size,
-			block_size_bytes,
-		)
 		size_bytes_written := bytes.buffer_write(b, block_size_bytes[:]) or_return
 		assert(
 			size_bytes_written == 4,
@@ -1365,7 +1342,6 @@ compress :: proc(
 	if len(data) % max_block_size_int != 0 {
 		number_of_blocks += 1
 	}
-	log.debugf("Number of blocks: %d\n", number_of_blocks)
 
 	blocks := make([dynamic]Frame_Block, 0, number_of_blocks, allocator) or_return
 
@@ -1383,15 +1359,6 @@ compress :: proc(
 		block.data = compress_block(block_data, allocator) or_return
 		block.checksum = xxhash.XXH32(block.data, 0)
 		block.size = len(block.data)
-
-		savings := (f64(1) - f64(len(block.data)) / f64(len(block_data))) * 100
-		log.debugf(
-			"Block #%d savings: %.2f%% (original=%d, compressed=%d)",
-			i,
-			savings,
-			len(block_data),
-			len(block.data),
-		)
 
 		append(&blocks, block) or_return
 	}
@@ -1448,7 +1415,7 @@ compress_block :: proc(
 	last_token_index := 0
 
 	for i := 0; i < len(data); {
-		if i >= len(data) - 5 {
+		if last_token_index >= (len(data) - 12) {
 			literals := data[last_token_index:]
 			token_byte := byte(len(literals) << 4)
 			bytes.buffer_write_byte(&b, token_byte) or_return
@@ -1592,32 +1559,46 @@ test_compress :: proc(t: ^testing.T) {
 		count := 0
 		start := time.tick_now()
 		for f in all_files {
-			log_filename := f
-			if filepath.is_abs(f) {
-				relative_filename, relative_filename_error := filepath.rel(cwd, f)
-				if relative_filename_error != nil {
-					fmt.panicf("Could not get relative filename: %v", relative_filename_error)
-				}
-				log_filename = relative_filename
-			}
-			path := filepath.join([]string{"test-logs", "compress", log_filename})
-			make_all_directories(path)
-			h, open_error := os.open(path, flags = os.O_WRONLY | os.O_CREATE, mode = 0o644)
-			if open_error != os.ERROR_NONE {
-				fmt.panicf("Could not open test log file '%s': %v", path, os.Errno(open_error))
-			}
-			logger := log.create_file_logger(h, lowest = .Debug)
 			ok := expect_compression_invariants_to_hold(
 				t,
 				f,
 				max_block_size = size,
-				logger = &logger,
+				logger = log.nil_logger(),
 			)
-			if ok {
-				os.remove(path)
-			} else {
-				fmt.panicf("Compression test failed for '%s', log file is at '%s'", f, path)
+			if !ok {
+				log_filename := f
+				if filepath.is_abs(f) {
+					relative_filename, relative_filename_error := filepath.rel(cwd, f)
+					if relative_filename_error != nil {
+						fmt.panicf("Could not get relative filename: %v", relative_filename_error)
+					}
+					log_filename = relative_filename
+				}
+				path := filepath.join([]string{"test-logs", "compress", log_filename})
+				make_all_directories(path)
+				with_extension := strings.concatenate([]string{path, ".log"})
+				h, open_error := os.open(
+					with_extension,
+					flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC,
+					mode = 0o644,
+				)
+				if open_error != os.ERROR_NONE {
+					fmt.panicf("Could not open test log file '%s': %v", path, os.Errno(open_error))
+				}
+				expect_compression_invariants_to_hold(
+					t,
+					f,
+					max_block_size = size,
+					logger = log.create_file_logger(h, lowest = .Debug),
+				)
+				os.close(h)
+				fmt.panicf(
+					"Compression test failed for '%s', log file is at '%s'",
+					f,
+					with_extension,
+				)
 			}
+
 			count += 1
 		}
 		diff := time.tick_diff(start, time.tick_now())
@@ -1646,15 +1627,7 @@ _all_files_walk_proc :: proc(
 	if match_error != nil {
 		log.panicf("Could not match filename: %v", match_error)
 	}
-	if !is_match {
-		log.debugf(
-			"Skipping file '%s' because it does not match '%s'",
-			info.fullpath,
-			data.filename_pattern,
-		)
-	}
 	if !info.is_dir && is_match {
-		log.debugf("Adding '%s'", info.fullpath)
 		append(data.files, info.fullpath)
 	}
 
@@ -1689,21 +1662,12 @@ expect_compression_invariants_to_hold :: proc(
 	t: ^testing.T,
 	path: string,
 	max_block_size: Max_Block_Size,
+	logger: log.Logger,
 	allocator := context.allocator,
-	logger: ^log.Logger = nil,
 ) -> (
 	ok: bool,
 ) {
-	path := path
-	if filepath.is_abs(path) {
-		cwd := os.get_current_directory()
-		relative_path, relative_path_error := filepath.rel(cwd, path, allocator)
-		if relative_path_error != nil {
-			fmt.panicf("Could not get relative path: %v", relative_path_error)
-		}
-		path = relative_path
-	}
-	context.logger = logger == nil ? runtime.default_logger() : logger^
+	context.logger = logger
 
 	file_data, read_ok := os.read_entire_file_from_filename(path, allocator)
 	if !read_ok {
@@ -1738,91 +1702,51 @@ expect_compression_invariants_to_hold :: proc(
 	) or_return
 	testing.expect(t, len(compressed) > 0, fmt.tprintf("Compressed data is empty\n")) or_return
 
-	frame_extraction_arena: virtual.Arena
-	arena_init_error = virtual.arena_init_static(&frame_extraction_arena, 2 * mem.Megabyte)
-	if arena_init_error != nil {
-		fmt.panicf("Could not initialize frame_extraction_arena: %v", arena_init_error)
-	}
-	frame_extraction_allocator := virtual.arena_allocator(&frame_extraction_arena)
-	frame, _, frame_error := frame_next(compressed, allocator = frame_extraction_allocator)
-	testing.expect(
-		t,
-		frame_error == nil,
-		fmt.tprintf("Frame error is not nil: %v\n", frame_error),
-	) or_return
-	testing.expect(
-		t,
-		frame.descriptor.version == 1,
-		fmt.tprintf("Frame version is not 1: %d\n", frame.descriptor.version),
-	) or_return
-	virtual.arena_destroy(&compression_arena)
-
 	decompression_arena: virtual.Arena
 	arena_init_error = virtual.arena_init_static(&decompression_arena, 8 * mem.Megabyte)
 	if arena_init_error != nil {
 		fmt.panicf("Could not initialize decompression_arena: %v", arena_init_error)
 	}
 	decompression_allocator := virtual.arena_allocator(&decompression_arena)
-	decompressed, decompress_error := frame_decompress(frame, allocator = decompression_allocator)
+	decompressed, rest, decompress_error := decompress(
+		compressed,
+		content_size = len(file_data),
+		allocator = decompression_allocator,
+	)
+	testing.expect(t, len(rest) == 0, fmt.tprintf("Rest is not empty: %#x\n", rest)) or_return
 	testing.expect(
 		t,
 		decompress_error == nil,
 		fmt.tprintf("Decompress error is not nil: %v\n", decompress_error),
 	) or_return
-	virtual.arena_destroy(&frame_extraction_arena)
 
-	switch d in decompressed {
-	case []byte:
-		testing.expect(
-			t,
-			bytes.compare(d, file_data) == 0,
-			fmt.tprintf("Decompressed data does not match original data: '%s'\n", d),
-		) or_return
-	case [][]byte:
-		concatenated := bytes.concatenate(d, allocator)
-		content_checksum := xxhash.XXH32(concatenated, 0)
-		concatenated_length := len(concatenated)
-		testing.expect(
-			t,
-			concatenated_length == frame.descriptor.content_size,
-			fmt.tprintf(
-				"Content size mismatch: %d != %d\n",
-				concatenated_length,
-				frame.descriptor.content_size,
-			),
-		) or_return
+	concatenated_length := len(decompressed)
+	testing.expect(
+		t,
+		concatenated_length == len(file_data),
+		fmt.tprintf("Content size mismatch: %d != %d\n", concatenated_length, len(file_data)),
+	) or_return
 
-		if concatenated_length != frame.descriptor.content_size {
-			concatenated_end: [25]byte
-			copy(concatenated_end[:], concatenated[len(concatenated) - 25:])
-			file_end: [25]byte
-			copy(file_end[:], file_data[len(file_data) - 25:])
+	if concatenated_length != len(file_data) {
+		concatenated_end: [25]byte
+		copy(concatenated_end[:], decompressed[len(decompressed) - 25:])
+		file_end: [25]byte
+		copy(file_end[:], file_data[len(file_data) - 25:])
 
-			fmt.printf("Concatenated end:\n'''\n%s\n'''\n", concatenated_end)
-			fmt.printf("File end:\n'''\n%s\n'''\n", file_end)
-		}
-
-		if concatenated_length == frame.descriptor.content_size {
-			testing.expect(
-				t,
-				u32le(content_checksum) == frame.content_checksum,
-				fmt.tprintf(
-					"Content checksum mismatch: %d != %d\n",
-					content_checksum,
-					frame.content_checksum,
-				),
-			) or_return
-			compare_result := bytes.compare(concatenated, file_data)
-			testing.expect(
-				t,
-				compare_result == 0,
-				fmt.tprintf(
-					"Decompressed data does not match original data: '%s'\n",
-					concatenated,
-				),
-			) or_return
-		}
+		fmt.printf("decompressed end:\n'''\n%s\n'''\n", concatenated_end)
+		fmt.printf("File end:\n'''\n%s\n'''\n", file_end)
 	}
+
+	if concatenated_length == len(file_data) {
+		compare_result := bytes.compare(decompressed, file_data)
+		testing.expect(
+			t,
+			compare_result == 0,
+			fmt.tprintf("Decompressed data does not match original data: '%s'\n", decompressed),
+		) or_return
+	}
+
+	virtual.arena_destroy(&compression_arena)
 
 	return true
 }

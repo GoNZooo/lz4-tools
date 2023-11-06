@@ -70,6 +70,8 @@ Frame_Descriptor_Read_Error :: union {
 	Data_Too_Small,
 }
 
+// Reads a `Frame_Descriptor` from a slice of bytes and returns the rest of the bytes after the
+// descriptor has been read.
 frame_descriptor_read :: proc(
 	data: []byte,
 	loc := #caller_location,
@@ -327,10 +329,10 @@ Frame_Decompress_Error :: union {
 Frame_Block_Decompress_Error :: struct {
 	block:            Frame_Block,
 	data_block_index: int,
-	error:            Data_Block_Error,
+	error:            Data_Block_Read_Error,
 }
 
-Data_Block_Error :: union {
+Data_Block_Read_Error :: union {
 	Zero_Offset,
 	Not_Enough_Literals,
 	io.Error,
@@ -353,6 +355,260 @@ Insufficient_Space_In_Buffer :: struct {
 Frame_Decompress_Result :: union {
 	[][]byte,
 	[]byte,
+}
+
+Decompress_Error :: union {
+	Frame_Descriptor_Read_Error,
+	Frame_Block_Read_Error,
+	Not_Enough_Literals,
+	Insufficient_Space_In_Buffer,
+	Zero_Offset,
+	Data_Too_Small,
+	Content_Checksum_Mismatch,
+	Infinite_Frame,
+	mem.Allocator_Error,
+}
+
+Content_Checksum_Mismatch :: struct {
+	expected: u32,
+	actual:   u32,
+}
+
+decompress :: proc(
+	input_data: []byte,
+	content_size := 0,
+	allocator := context.allocator,
+) -> (
+	decompressed: []byte,
+	rest: []byte,
+	error: Decompress_Error,
+) {
+	data := input_data
+	defer {
+		log.debugf("len(decompressed) = %d", len(decompressed))
+		log.debugf("%s", decompressed)
+	}
+
+	descriptor, after_descriptor := frame_descriptor_read(data) or_return
+	decompressed = make(
+		[]byte,
+		descriptor.content_size == 0 ? content_size : descriptor.content_size,
+		allocator,
+	) or_return
+
+	data = after_descriptor
+	log.debugf("len(after_descriptor) = %d", len(after_descriptor))
+
+	copy_index := 0
+	for {
+		fb, after_fb, read_error := frame_block_read(data, descriptor.has_block_checksum)
+		_, is_end_mark_found := read_error.(End_Mark_Found)
+		if is_end_mark_found {
+			break
+		}
+		data = after_fb
+
+		i := 0
+		for {
+			if i == fb.size {
+				break
+			}
+
+			if !fb.compressed {
+				copy(decompressed[copy_index:], fb.data)
+				copy_index += len(fb.data)
+
+				continue
+			}
+
+			token_byte := fb.data[i]
+			i += 1
+			literals_length := int(token_byte >> 4)
+			match_length := int(token_byte & 0x0f)
+			if literals_length == 15 {
+				for {
+					s := fb.data[i]
+					i += 1
+					literals_length += int(s)
+					if s != 255 {
+						break
+					}
+				}
+			}
+
+			literals := fb.data[i:i + literals_length]
+			log.debugf("literals = %s", literals)
+			i += literals_length
+
+			if len(literals) != literals_length {
+				return nil,
+					nil,
+					Not_Enough_Literals{expected = literals_length, actual = len(literals)}
+			}
+
+			copy(decompressed[copy_index:], literals)
+			copy_index += len(literals)
+
+			if i == len(fb.data) {
+				// This means that there is no offset, which is an end marker
+				continue
+			}
+
+			offset_bytes := [2]byte{fb.data[i], fb.data[i + 1]}
+			i += 2
+			offset := transmute(u16le)offset_bytes
+			if offset == 0 {
+				return nil, nil, Zero_Offset{position = i}
+			}
+
+			if match_length == 15 {
+				for {
+					m := fb.data[i]
+					i += 1
+					match_length += int(m)
+					if m != 255 {
+						break
+					}
+				}
+			}
+			match_length += 4
+
+			copy_start := copy_index - int(offset)
+			copy_end := copy_start + match_length
+			if copy_end > len(decompressed) {
+				return nil,
+					nil,
+					Insufficient_Space_In_Buffer{expected = copy_end, actual = len(decompressed)}
+			}
+
+			if int(offset) < match_length {
+				copy_bytes := decompressed[copy_start:copy_index]
+				log.debugf(
+					"copy_start=%d, copy_end=%d, copy_index=%d, offset=%d, match_length=%d, copy_bytes='%s'",
+					copy_start,
+					copy_end,
+					copy_index,
+					offset,
+					match_length,
+					copy_bytes,
+				)
+				copy(decompressed[copy_index:], copy_bytes)
+				copy_index += len(copy_bytes)
+				remaining_bytes := match_length - int(offset)
+				for i in 0 ..< remaining_bytes {
+					decompressed[copy_index + i] = copy_bytes[i % len(copy_bytes)]
+				}
+				copy_index += remaining_bytes
+			} else {
+				copy_bytes := decompressed[copy_start:copy_end]
+				log.debugf("copy_bytes = %s", copy_bytes)
+				copy(decompressed[copy_index:], copy_bytes)
+				copy_index += match_length
+			}
+
+			if i + 4 > len(fb.data) {
+				return nil, nil, Data_Too_Small{size = len(fb.data)}
+			}
+		}
+	}
+
+	end_marker_bytes: [4]byte
+	copy(end_marker_bytes[:], data[:4])
+	end_marker := transmute(u32le)end_marker_bytes
+	if end_marker != 0 {
+		return nil, nil, Infinite_Frame{start = len(input_data) - len(data)}
+	}
+	data = data[4:]
+
+	if descriptor.has_content_checksum {
+		if len(data) < 4 {
+			return nil, nil, Data_Too_Small{size = len(data)}
+		}
+		content_checksum_buffer: [4]byte
+		copy(content_checksum_buffer[:], data[:4])
+		content_checksum := transmute(u32le)content_checksum_buffer
+		calculated_content_checksum := u32le(xxhash.XXH32(decompressed, 0))
+		log.debugf(
+			"content_checksum_buffer=%#x, calculated=%#02x",
+			content_checksum_buffer,
+			calculated_content_checksum,
+		)
+
+		if content_checksum != calculated_content_checksum {
+			return decompressed,
+				nil,
+				Content_Checksum_Mismatch{
+					expected = u32(content_checksum),
+					actual = u32(calculated_content_checksum),
+				}
+		}
+	}
+	data = data[4:]
+
+	return decompressed, data, nil
+}
+
+Frame_Block_Read_Error :: union {
+	End_Mark_Found,
+	Data_Too_Small,
+}
+
+End_Mark_Found :: struct {
+	rest: []byte,
+}
+
+frame_block_read :: proc(
+	data: []byte,
+	has_checksum: bool,
+) -> (
+	fb: Frame_Block,
+	rest: []byte,
+	error: Frame_Block_Read_Error,
+) {
+	i := 0
+
+	if len(data) < 4 {
+		return Frame_Block{}, nil, Data_Too_Small{size = len(data)}
+	}
+	block_size_buffer: [4]byte
+	copy(block_size_buffer[:], data[i:i + 4])
+	i += 4
+	block_size := transmute(u32)block_size_buffer
+	compressed := block_size & 0x8000_0000 == 0
+	size := int(block_size & 0x7f_ff_ff_ff)
+	if block_size == 0 {
+		return Frame_Block{}, data[i:], End_Mark_Found{rest = data[i:]}
+	}
+	log.debugf(
+		"read: compressed=%v\thas_checksum=%v\tsize=%d\tsize_bytes=%x\n",
+		compressed,
+		has_checksum,
+		size,
+		block_size_buffer,
+	)
+
+	if len(data) < i + size {
+		return Frame_Block{}, nil, Data_Too_Small{size = len(data)}
+	}
+	block_data := data[i:i + size]
+	i += size
+
+	checksum: u32le
+	if has_checksum {
+		checksum_buffer: [4]byte
+		copy(checksum_buffer[:], data[i:i + 4])
+		i += 4
+		checksum = transmute(u32le)checksum_buffer
+	}
+
+	fb = Frame_Block {
+		size       = size,
+		data       = block_data,
+		checksum   = u32(checksum),
+		compressed = compressed,
+	}
+
+	return fb, data[i:], nil
 }
 
 frame_decompress :: proc(
@@ -407,7 +663,7 @@ frame_block_decompress :: proc(
 
 	block_data := fb.data
 	for len(block_data) > 0 {
-		db, rest, data_block_read_error := data_block_read(block_data, allocator)
+		db, rest, data_block_read_error := data_block_read(block_data)
 		if data_block_read_error != nil {
 			return nil,
 				Frame_Block_Decompress_Error{
@@ -477,6 +733,58 @@ test_frame_decompress :: proc(t: ^testing.T) {
 
 	log.infof("Decompressed %d files", len(paths))
 }
+
+@(test, private = "package")
+test_decompress :: proc(t: ^testing.T) {
+	context.logger = log.create_console_logger()
+	Test_Case :: struct {
+		compressed_path: string,
+		plain_text_path: string,
+	}
+
+	own_paths := []string{"test-data/plain-01.txt.lz4", "test-data/lz4-2023-11-01.odin.lz4"}
+	odin_files, odin_files_error := all_files_in_directory("test-data/large-odin-files", "*.lz4")
+	if odin_files_error != nil {
+		fmt.panicf("Could not read files in directory: %v\n", odin_files_error)
+	}
+	paths := slice.concatenate([][]string{own_paths, odin_files})
+	cwd := os.get_current_directory()
+
+	for path in paths {
+		log_filename := path
+		if filepath.is_abs(path) {
+			relative_filename, relative_filename_error := filepath.rel(cwd, path)
+			if relative_filename_error != nil {
+				fmt.panicf("Could not get relative filename: %v", relative_filename_error)
+			}
+			log_filename = relative_filename
+		}
+		log_path := filepath.join([]string{"test-logs", "decompress", log_filename})
+		make_all_directories(log_path)
+		h, open_error := os.open(
+			log_path,
+			flags = os.O_WRONLY | os.O_CREATE | os.O_TRUNC,
+			mode = 0o644,
+		)
+		defer os.close(h)
+		if open_error != os.ERROR_NONE {
+			fmt.panicf("Could not open test log file '%s': %v", log_path, os.Errno(open_error))
+		}
+		ok := expect_decompress_invariants_to_hold(
+			t,
+			path,
+			logger = log.create_file_logger(h, lowest = .Debug),
+		)
+		if ok {
+			os.remove(log_path)
+		} else {
+			fmt.panicf("Decompression test failed for '%s', log file is at '%s'", path, log_path)
+		}
+	}
+
+	log.infof("Decompressed %d files", len(paths))
+}
+
 
 @(private = "file")
 _default_determine_logging_proc :: proc(_: string) -> bool {
@@ -585,6 +893,81 @@ expect_decompress_frame_invariants_to_hold :: proc(
 }
 
 @(private = "file")
+expect_decompress_invariants_to_hold :: proc(
+	t: ^testing.T,
+	compressed_path: string,
+	logger: log.Logger,
+) -> bool {
+	dir := filepath.dir(compressed_path)
+	stem := filepath.stem(compressed_path)
+	path := filepath.join({dir, stem})
+	context.logger = logger
+
+	file_data, read_ok := os.read_entire_file_from_filename(compressed_path)
+	if !read_ok {
+		fmt.panicf("Could not read file for test: '%s'", compressed_path)
+	}
+	log.debugf("len(compressed) = %d", len(file_data))
+
+	plain_data, plain_read_ok := os.read_entire_file_from_filename(path)
+	if !plain_read_ok {
+		fmt.panicf("Could not read file for test: '%s'", path)
+	}
+	log.debugf("len(plain) = %d", len(plain_data))
+
+	decompressed, rest, decompress_error := decompress(file_data, content_size = len(plain_data))
+	testing.expect(
+		t,
+		decompress_error == nil,
+		fmt.tprintf("Decompress error is not nil ('%s'): %v\n", compressed_path, decompress_error),
+	) or_return
+	testing.expect(t, len(rest) == 0, fmt.tprintf("Rest is not empty: %d\n", len(rest))) or_return
+
+	buffer: []byte
+
+	compare_result := bytes.compare(decompressed, plain_data)
+	testing.expect(
+		t,
+		compare_result == 0,
+		fmt.tprintf("Decompressed data does not match plain data in file '%s'\n", path),
+	) or_return
+
+	if compare_result != 0 {
+		plain_length := len(plain_data)
+		decompressed_length := len(decompressed)
+		if plain_length != decompressed_length {
+			fmt.panicf(
+				"Decompressed data does not match plain data in file '%s':\n\tLengths do not match: %d != %d\n",
+				path,
+				plain_length,
+				decompressed_length,
+			)
+		}
+
+		for pc, i in plain_data {
+			dc := buffer[i]
+			if pc != dc {
+				decompressed: [50]byte
+				plaintext: [50]byte
+				copy(decompressed[:], buffer[i - 25:])
+				copy(plaintext[:], plain_data[i - 25:])
+				fmt.panicf(
+					"Mismatch @ %d: %#x != %#x\n\n\tPlain:\n\t '%s'\nDecompressed:\n\t'%s'\n",
+					i,
+					pc,
+					dc,
+					plaintext,
+					decompressed,
+				)
+			}
+		}
+	}
+
+	return true
+}
+
+
+@(private = "file")
 frame_decompress_dependently :: proc(
 	frame: Frame,
 	allocator := context.allocator,
@@ -597,11 +980,10 @@ frame_decompress_dependently :: proc(
 
 data_block_read :: proc(
 	data: []byte,
-	allocator := context.allocator,
 ) -> (
 	block: Data_Block,
 	rest: []byte,
-	error: Data_Block_Error,
+	error: Data_Block_Read_Error,
 ) {
 	i := 0
 	token_byte := data[i]

@@ -53,12 +53,95 @@ Frame_Next_Error :: union {
 
 No_Frame :: struct {}
 
+No_Magic_Value :: struct {
+	bytes: [4]byte,
+}
+
 Data_Too_Small :: struct {
 	size: int,
 }
 
 Infinite_Frame :: struct {
 	start: int,
+}
+
+Frame_Descriptor_Read_Error :: union {
+	No_Magic_Value,
+	Data_Too_Small,
+}
+
+frame_descriptor_read :: proc(
+	data: []byte,
+	loc := #caller_location,
+) -> (
+	fd: Frame_Descriptor,
+	rest: []byte,
+	error: Frame_Descriptor_Read_Error,
+) {
+	i := 0
+	if len(data) < 2 {
+		return Frame_Descriptor{}, data, Data_Too_Small{size = len(data)}
+	}
+
+	magic_value_buffer: [4]byte
+	copy(magic_value_buffer[:], data[i:i + 4])
+	magic_value := transmute(u32le)magic_value_buffer
+	if magic_value != MAGIC_VALUE {
+		return Frame_Descriptor{}, data, No_Magic_Value{bytes = magic_value_buffer}
+	}
+	i += 4
+
+	flags := data[i]
+	i += 1
+
+	fd.version = int(flags >> 6)
+	fd.block_independence = flags & 0x20 != 0
+	fd.has_block_checksum = flags & 0x10 != 0
+	has_content_size := flags & 0x08 != 0
+	fd.has_content_checksum = flags & 0x04 != 0
+	has_dictionary_id := flags & 0x01 != 0
+
+	bd := data[i]
+	i += 1
+	fd.block_max_size = get_block_max_size((bd & 0x70) >> 4)
+
+	if has_content_size {
+		if len(data) < i + 8 {
+			return Frame_Descriptor{}, data, Data_Too_Small{size = len(data)}
+		}
+
+		content_size_buffer: [8]byte
+		copy(content_size_buffer[:], data[i:i + 8])
+		fd.content_size = cast(int)transmute(u64le)content_size_buffer
+		i += 8
+	}
+
+	if has_dictionary_id {
+		if len(data) < i + 4 {
+			return Frame_Descriptor{}, data, Data_Too_Small{size = len(data)}
+		}
+
+		dictionary_id_buffer: [4]byte
+		copy(dictionary_id_buffer[:], data[i:i + 4])
+		fd.dictionary_id = cast(int)transmute(u32le)dictionary_id_buffer
+	}
+
+	checksum_bytes := data[4:i]
+	calculated_checksum := u8(xxhash.XXH32(checksum_bytes, 0) >> 8)
+	fd.calculated_checksum = calculated_checksum
+	fd.header_checksum = data[i]
+	i += 1
+	assert(
+		fd.header_checksum == calculated_checksum,
+		fmt.tprintf(
+			"Checksum mismatch: %#x != %#x (called from %v)",
+			fd.header_checksum,
+			calculated_checksum,
+			loc,
+		),
+	)
+
+	return fd, data[i:], nil
 }
 
 frame_next :: proc(

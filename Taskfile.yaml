@@ -38,7 +38,7 @@ tasks:
 
   test_lz4:
     cmds:
-      - odin test lz4 -out:bin/lz4-test -o:none -debug
+      - odin test lz4 -out:bin/lz4-test -o:speed
     sources:
       - lz4/**/*.odin
     generates:

@@ -54,5 +54,30 @@ tasks:
     aliases:
       - dt
 
+  decompression_ui:
+    deps:
+      - build_decompression_ui
+    cmds:
+      - bin/decompression-ui
+    method: none
+    silent: true
+
+  build_decompression_ui:
+    cmds:
+      - odin build decompression-ui -out:bin/decompression-ui -o:none -debug -collection:dependencies=dependencies
+    sources:
+      - decompression-ui/**/*.odin
+      - lz4/**/*.odin
+      - dependencies/imgui/**/*.odin
+    generates:
+      - bin/decompression-ui
+    silent: true
+
+  debug_decompression_ui:
+    cmds:
+      - gdb bin/decompression-ui
+    method: none
+    silent: true
+
 interval: 100ms
 

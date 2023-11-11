@@ -983,11 +983,8 @@ data_block_read :: proc(
 	}
 
 	literals := data[i:i + block.length]
-
 	assert(len(literals) == block.length)
-
 	block.literals = literals
-
 	i += block.length
 
 	if i == len(data) {

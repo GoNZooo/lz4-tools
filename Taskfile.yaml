@@ -67,7 +67,6 @@ tasks:
       - odin build decompression-ui -out:bin/decompression-ui -o:none -debug -collection:dependencies=dependencies
     sources:
       - decompression-ui/**/*.odin
-      - lz4/**/*.odin
       - dependencies/imgui/**/*.odin
     generates:
       - bin/decompression-ui
@@ -77,6 +76,18 @@ tasks:
     cmds:
       - gdb bin/decompression-ui
     method: none
+    silent: true
+
+  build_ui_lib:
+    cmds:
+      - odin build decompression-ui/ui -out:bin/ui-new -o:none -debug -collection:dependencies=dependencies -build-mode:shared
+      - mv bin/ui-new.so bin/ui.so
+    sources:
+      - decompression-ui/ui/**/*.odin
+      - lz4/**/*.odin
+      - dependencies/imgui/**/*.odin
+    generates:
+      - bin/ui.so
     silent: true
 
 interval: 100ms

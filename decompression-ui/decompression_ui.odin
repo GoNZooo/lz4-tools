@@ -17,18 +17,13 @@ import "dependencies:imgui/imgui_impl_opengl3"
 import gl "vendor:OpenGL"
 import "vendor:glfw"
 
-Draw_Proc :: #type proc(
-	ctx: ^imgui.Context,
-	mem_alloc: imgui.MemAllocFunc,
-	mem_free: imgui.MemFreeFunc,
-	user_data: rawptr,
-)
+import "./ui"
 
 load_draw_procedure :: proc(
 	draw_lib: ^dynlib.Library,
-	draw_proc: Draw_Proc,
+	draw_proc: ui.Draw_Proc,
 	last_version: ^time.Time,
-) -> Draw_Proc {
+) -> ui.Draw_Proc {
 	file_info, errno := os.stat("bin/ui.so")
 	if errno != os.ERROR_NONE {
 		log.errorf("Failed to stat ui.so: %v", errno)
@@ -78,7 +73,7 @@ load_draw_procedure :: proc(
 	draw_lib^ = library
 	last_version^ = file_info.modification_time
 
-	return cast(Draw_Proc)draw_address
+	return cast(ui.Draw_Proc)draw_address
 }
 
 main :: proc() {
@@ -129,9 +124,13 @@ main :: proc() {
 	mem_free: imgui.MemFreeFunc
 	user_data: rawptr
 	imgui.GetAllocatorFunctions(&mem_alloc, &mem_free, &user_data)
-	draw: Draw_Proc
+	draw: ui.Draw_Proc
 	draw_library: dynlib.Library
 	last_draw_version: time.Time
+	filename_buffer: [256]byte
+	state: ui.State
+	state.filename_buffer = filename_buffer[:]
+	state.current_directory = os.get_current_directory()
 
 	for !glfw.WindowShouldClose(window) {
 		draw = load_draw_procedure(&draw_library, draw, &last_draw_version)
@@ -141,7 +140,7 @@ main :: proc() {
 		imgui_impl_glfw.NewFrame()
 		imgui.NewFrame()
 
-		draw(imgui_context, mem_alloc, mem_free, user_data)
+		draw(imgui_context, mem_alloc, mem_free, user_data, &state)
 
 		imgui.Render()
 		display_w, display_h := glfw.GetFramebufferSize(window)

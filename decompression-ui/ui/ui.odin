@@ -46,13 +46,41 @@ Write :: struct {
 	match_data:    []byte,
 }
 
+Draw_Proc :: #type proc(
+	ctx: ^imgui.Context,
+	mem_alloc: imgui.MemAllocFunc,
+	mem_free: imgui.MemFreeFunc,
+	user_data: rawptr,
+	state: ^State,
+)
+
+State :: struct {
+	filename_buffer:      []byte,
+	frame_descriptor:     lz4.Frame_Descriptor,
+	remaining_data:       []byte,
+	current_frame_block:  lz4.Frame_Block,
+	block:                lz4.Data_Block,
+	writes:               [dynamic]Write,
+	output:               []byte,
+	remaining_block_data: []byte,
+	current_directory:    string,
+	file_picker_open:     bool,
+	file_picker:          File_Picker,
+	copy_index:           int,
+}
+
 @(export)
 draw :: proc(
 	ctx: ^imgui.Context,
 	mem_alloc: imgui.MemAllocFunc,
 	mem_free: imgui.MemFreeFunc,
 	user_data: rawptr,
+	state: ^State,
 ) {
+	@(static)
+	i := 0
+	i += 1
+
 	imgui.SetCurrentContext(ctx)
 	imgui.SetAllocatorFunctions(mem_alloc, mem_free, user_data)
 
@@ -60,43 +88,14 @@ draw :: proc(
 	imgui.SetNextWindowPos({0, 0}, .Appearing)
 	imgui.SetNextWindowSize(viewport.Size, .Appearing)
 
-	@(static)
-	file_picker_open := false
-	@(static)
-	writes: [dynamic]Write
-	@(static)
-	copy_index := 0
-	@(static)
-	current_frame_block: lz4.Frame_Block
-	@(static)
-	block: lz4.Data_Block
-	@(static)
-	remaining_block_data: []byte
-	@(static)
-	filename_buffer: [256]byte
-	@(static)
-	frame_descriptor: lz4.Frame_Descriptor
-	@(static)
-	current_directory: string
-	@(static)
-	file_picker: File_Picker
-	@(static)
-	remaining_data: []byte
-	@(static)
-	output: []byte
-
-	if current_directory == "" {
-		current_directory = os.get_current_directory()
-	}
-
 	if imgui.Begin("Decompression", nil, {.NoResize, .NoCollapse, .NoMove, .MenuBar}) {
 		imgui.SetWindowFontScale(2.0)
 
 		if imgui.BeginMenuBar() {
 			if imgui.BeginMenu("File") {
 				if imgui.MenuItem("Open") {
-					file_picker_initialize(&file_picker, current_directory)
-					file_picker_open = true
+					file_picker_initialize(&state.file_picker, state.current_directory)
+					state.file_picker_open = true
 				}
 				imgui.EndMenu()
 			}
@@ -106,12 +105,14 @@ draw :: proc(
 
 		if imgui.InputText(
 			   "Filename",
-			   transmute(cstring)&filename_buffer,
-			   len(filename_buffer),
+			   transmute(cstring)&state.filename_buffer[0],
+			   len(state.filename_buffer),
 			   {.EnterReturnsTrue},
 		   ) {
 			if imgui.IsKeyPressed(.Enter) {
-				frame_descriptor, remaining_data = load_file(string(filename_buffer[:]))
+				state.frame_descriptor, state.remaining_data = load_file(
+					string(state.filename_buffer),
+				)
 			}
 		}
 		imgui.SameLine()
@@ -119,66 +120,75 @@ draw :: proc(
 		cursor_x := imgui.GetCursorPosX()
 		imgui.SetCursorPosX(cursor_x + available.x / 2)
 		if imgui.Button("Load") {
-			frame_descriptor, remaining_data = load_file(string(filename_buffer[:]))
+			state.frame_descriptor, state.remaining_data = load_file(string(state.filename_buffer))
 		}
-		imgui.Text("Unprocessed bytes in file: %d", len(remaining_data))
+		imgui.Text("Unprocessed bytes in file: %d", len(state.remaining_data))
 
-		if imgui.Button("Load more!!!") {
-			if current_frame_block.size == 0 {
+		if imgui.Button("Load more") {
+			if state.current_frame_block.size == 0 {
 				frame_block_read_error: lz4.Frame_Block_Read_Error
-				current_frame_block, _, frame_block_read_error = lz4.frame_block_read(
-					remaining_data,
-					frame_descriptor.has_block_checksum,
+				state.current_frame_block, _, frame_block_read_error = lz4.frame_block_read(
+					state.remaining_data,
+					state.frame_descriptor.has_block_checksum,
 				)
-				output = make(
+				state.output = make(
 					[]byte,
-					frame_descriptor.content_size == 0 \
+					state.frame_descriptor.content_size == 0 \
 					? 64 * mem.Kilobyte \
-					: frame_descriptor.content_size,
+					: state.frame_descriptor.content_size,
 				)
 				if frame_block_read_error != nil {
 					log.errorf("Error reading frame block: %v", frame_block_read_error)
 				}
-				remaining_block_data = current_frame_block.data
+				state.remaining_block_data = state.current_frame_block.data
 			}
 
 			data_block_read_error: lz4.Data_Block_Read_Error
-			block, remaining_block_data, data_block_read_error = lz4.data_block_read(
-				remaining_block_data,
+			state.block, state.remaining_block_data, data_block_read_error = lz4.data_block_read(
+				state.remaining_block_data,
 			)
 
 			// extract to output
-			copy(output[copy_index:], block.literals)
-			copy_index += len(block.literals)
+			copy(state.output[state.copy_index:], state.block.literals)
+			state.copy_index += len(state.block.literals)
 
 			copy_bytes: []byte
-			if block.offset < block.match_length {
-				copy_start := copy_index - block.offset
-				copy_bytes = output[copy_start:copy_index]
+			if state.block.offset < state.block.match_length {
+				copy_start := state.copy_index - state.block.offset
+				copy_bytes = state.output[copy_start:state.copy_index]
 
-				copy(output[copy_index:], copy_bytes)
-				copy_index += len(copy_bytes)
+				copy(state.output[state.copy_index:], copy_bytes)
+				state.copy_index += len(copy_bytes)
 
-				remaining := block.match_length - len(copy_bytes)
+				remaining := state.block.match_length - len(copy_bytes)
 				for i in 0 ..< remaining {
-					output[copy_index + i] = copy_bytes[i % len(copy_bytes)]
+					state.output[state.copy_index + i] = copy_bytes[i % len(copy_bytes)]
 				}
-				copy_index += remaining
+				state.copy_index += remaining
 			} else {
-				copy_start := copy_index - block.offset
-				copy_end := copy_start + block.match_length
-				copy_bytes = output[copy_start:copy_end]
-				copy(output[copy_index:], copy_bytes)
-				copy_index += block.match_length
+				copy_start := state.copy_index - state.block.offset
+				copy_end := copy_start + state.block.match_length
+				copy_bytes = state.output[copy_start:copy_end]
+				copy(state.output[state.copy_index:], copy_bytes)
+				state.copy_index += state.block.match_length
 			}
 
-			append(&writes, Write{literals = block.literals, match = copy_bytes})
+			append(&state.writes, Write{literals = state.block.literals, match = copy_bytes})
 		}
 
-		if frame_descriptor.version == 1 {
+		if state.frame_descriptor.version == 1 {
 			draw_panel(
 				draw_proc = draw_frame_descriptor,
-				data = &frame_descriptor,
+				data = &state.frame_descriptor,
+				padding = 20,
+				color = {128, 128, 128, 255},
+				rounding = 10,
+				thickness = 1,
+			)
+			imgui.SameLine()
+			draw_panel(
+				draw_proc = draw_frame_descriptor,
+				data = &state.frame_descriptor,
 				padding = 20,
 				color = {128, 128, 128, 255},
 				rounding = 10,
@@ -186,13 +196,13 @@ draw :: proc(
 			)
 		}
 
-		for write in writes {
+		for write in state.writes {
 			for line in strings.split(string(write.literals), "\n") {
 				imgui.Text(strings.clone_to_cstring(line))
 			}
 			imgui.SameLineEx(0, 0)
 			for line in strings.split(string(write.match), "\n") {
-				imgui.TextColored({0, 1, 0, 1}, strings.clone_to_cstring(line))
+				imgui.TextColored({1, 0, 1, 1}, strings.clone_to_cstring(line))
 			}
 			imgui.SameLineEx(0, 0)
 		}
@@ -200,14 +210,14 @@ draw :: proc(
 		imgui.End()
 	}
 
-	if file_picker_open {
+	if state.file_picker_open {
 		imgui.OpenPopup("OpenFile", {})
 	}
 
-	if imgui.BeginPopupModal("OpenFile", &file_picker_open, {}) {
+	if imgui.BeginPopupModal("OpenFile", &state.file_picker_open, {}) {
 		defer imgui.EndPopup()
 
-		switch s in &file_picker.state {
+		switch s in &state.file_picker.state {
 		case Hidden:
 		// nothing
 		case Shown:
@@ -228,17 +238,17 @@ draw :: proc(
 				if imgui.Selectable(file_cs) {
 					_, is_directory := file.(Directory)
 					if is_directory {
-						file_picker_initialize(&file_picker, path)
+						file_picker_initialize(&state.file_picker, path)
 					} else {
-						copy(filename_buffer[:], path)
-						frame_descriptor, remaining_data = load_file(path)
+						copy(state.filename_buffer, path)
+						state.frame_descriptor, state.remaining_data = load_file(path)
 
-						clear(&writes)
-						copy_index = 0
-						current_frame_block = lz4.Frame_Block{}
-						remaining_block_data = nil
+						clear(&state.writes)
+						state.copy_index = 0
+						state.current_frame_block = lz4.Frame_Block{}
+						state.remaining_block_data = nil
 
-						file_picker_open = false
+						state.file_picker_open = false
 					}
 				}
 				imgui.PopStyleColor()
@@ -276,6 +286,8 @@ draw_panel :: proc(
 	rounding: f32,
 	thickness: f32,
 ) {
+	imgui.BeginGroup()
+
 	imgui.Dummy({0, padding})
 	imgui.Dummy({padding, 0})
 	imgui.SameLineEx(0, 0)
@@ -298,6 +310,9 @@ draw_panel :: proc(
 		flags = {},
 	)
 	imgui.Dummy({0, padding})
+	imgui.EndGroup()
+	imgui.SameLineEx(0, 0)
+	imgui.Dummy({padding, 0})
 }
 
 draw_frame_descriptor :: proc(data: rawptr) {
